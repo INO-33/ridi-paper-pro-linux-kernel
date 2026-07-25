@@ -1,0 +1,501 @@
+/*
+ * RIDI PAPER PRO / Netronix E70Q10
+ *
+ * Initial device tree reconstructed from the running 3.0.35 kernel, stock
+ * hwcfg and the published Tolino Epos Netronix board-file source.  Drivers
+ * marked "needs-port" are intentionally described here even though their
+ * Tolino 3.0 implementations still need forward-porting to this 4.9 tree.
+ */
+/dts-v1/;
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include "imx6sl.dtsi"
+
+/ {
+	model = "RIDI PAPER PRO (Netronix E70Q10)";
+	compatible = "ridi,e70q10", "netronix,e70q10", "fsl,imx6sl";
+
+	aliases {
+		mmc0 = &usdhc4; /* internal eMMC */
+		mmc1 = &usdhc2; /* external microSD */
+		mmc2 = &usdhc3; /* RTL8189FS SDIO */
+	};
+
+	chosen {
+		stdout-path = &uart1;
+	};
+
+	/* Stock U-Boot reserves the top 6 MiB for hwcfg/waveform/logo/ntxfw. */
+	memory {
+		device_type = "memory";
+		reg = <0x80000000 0x3fa00000>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_keys>;
+
+		page-left-up {
+			label = "page-left-up";
+			gpios = <&gpio3 26 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PAGEUP>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		page-left-down {
+			label = "page-left-down";
+			gpios = <&gpio3 30 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PAGEDOWN>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		page-right-up {
+			label = "page-right-up";
+			gpios = <&gpio4 0 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PAGEUP>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		page-right-down {
+			label = "page-right-down";
+			gpios = <&gpio4 2 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_PAGEDOWN>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		power {
+			label = "power";
+			gpios = <&gpio5 8 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_POWER>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
+		hall {
+			label = "hall-cover";
+			gpios = <&gpio5 12 GPIO_ACTIVE_LOW>;
+			linux,input-type = <EV_SW>;
+			linux,code = <SW_LID>;
+			debounce-interval = <50>;
+			wakeup-source;
+		};
+	};
+
+	wifi_pwrseq: wifi-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_wifi_ctrl>;
+		reset-gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
+		post-power-on-delay-ms = <200>;
+	};
+};
+
+&epdc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_epdc>;
+	V3P3-supply = <&tps_v3p3>;
+	VCOM-supply = <&tps_vcom>;
+	DISPLAY-supply = <&tps_display>;
+	status = "okay";
+};
+
+&i2c2 {
+	/* 75 kHz is the reliable command-transition rate on this controller. */
+	/* Netronix mx6sl board data and the working stock kernel use 100 kHz. */
+	clock-frequency = <100000>;
+	/* Match stock: physically gate the controller after every transfer. */
+	fsl,stock-transfer-clock-gating;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_i2c2>;
+	status = "okay";
+
+	touchscreen@24 {
+		compatible = "cy,cyttsp5_i2c_adapter";
+		reg = <0x24>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_touch>;
+		interrupt-parent = <&gpio5>;
+		interrupts = <6 IRQ_TYPE_LEVEL_LOW>;
+		reset-gpios = <&gpio5 13 GPIO_ACTIVE_LOW>;
+
+		cyttsp5_core {
+			name = "cyttsp5_core";
+			cy,irq_gpio = <134>;
+			cy,rst_gpio = <141>;
+			cy,hid_desc_register = <1>;
+			cy,level_irq_udelay = <10>;
+			cy,flags = <4>;
+
+			cy,mt {
+				name = "cy,mt";
+				cy,inp_dev_name = "cyttsp5_mt";
+				/* Netronix E70Q10 stock effective INV_X | INV_Y. */
+				cy,flags = <0x30>;
+				cy,abs = <
+					0x35 0 1871 0 0
+					0x36 0 1403 0 0
+					0x3a 0 255 0 0
+					0xffffffff 0 255 0 0
+					0x39 0 15 0 0
+					0x30 0 255 0 0
+					0x31 0 255 0 0
+					0x34 0xffffffff 1 0 0
+					0x37 0 1 0 0
+					0x3b 0 255 0 0
+				>;
+			};
+		};
+	};
+
+	frontlight@38 {
+		compatible = "ti,lm3630a"; /* Netronix table support needs-port */
+		reg = <0x38>;
+	};
+
+	epd-pmic@68 {
+		compatible = "ti,tps65185";
+		reg = <0x68>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_epd_pmic>;
+		interrupt-parent = <&gpio2>;
+		interrupts = <9 IRQ_TYPE_EDGE_FALLING>;
+		wakeup-gpios = <&gpio2 7 GPIO_ACTIVE_HIGH>;
+		powerup-gpios = <&gpio2 8 GPIO_ACTIVE_HIGH>;
+		pwrgood-gpios = <&gpio2 13 GPIO_ACTIVE_HIGH>;
+		vcom-gpios = <&gpio2 3 GPIO_ACTIVE_HIGH>;
+		vin-gpios = <&gpio2 14 GPIO_ACTIVE_HIGH>;
+		ridi,vcom-negative-microvolt = <1560000>;
+
+		regulators {
+			tps_display: DISPLAY {
+				regulator-name = "DISPLAY";
+			};
+
+			tps_vcom: VCOM {
+				regulator-name = "VCOM";
+			};
+
+			tps_v3p3: V3P3 {
+				regulator-name = "V3P3";
+			};
+		};
+	};
+};
+
+&i2c3 {
+	clock-frequency = <100000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_i2c3>;
+	status = "okay";
+
+	pmic@32 {
+		compatible = "ricoh,rc5t619";
+		reg = <0x32>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_ricoh_irq>;
+		interrupt-parent = <&gpio5>;
+		interrupts = <11 IRQ_TYPE_LEVEL_LOW>;
+
+		regulators {
+			rc5t619_dc1: DCDC1 {
+				regulator-name = "RC5T619_DC1";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_dc2: DCDC2 {
+				regulator-name = "RC5T619_DC2";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_dc3: DCDC3 {
+				regulator-name = "RC5T619_DC3";
+				regulator-min-microvolt = <950000>;
+				regulator-max-microvolt = <1425000>;
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_dc4: DCDC4 {
+				regulator-name = "RC5T619_DC4";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_dc5: DCDC5 {
+				regulator-name = "RC5T619_DC5";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_ldo1: LDO1 {
+				regulator-name = "RC5T619_LDO1";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_ldo2: LDO2 {
+				regulator-name = "RC5T619_LDO2";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_ldo3: LDO3 {
+				regulator-name = "RC5T619_LDO3";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_ldo4: LDO4 { regulator-name = "RC5T619_LDO4"; };
+			rc5t619_ldo5: LDO5 {
+				regulator-name = "RC5T619_LDO5";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_ldo6: LDO6 {
+				regulator-name = "RC5T619_LDO6";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			rc5t619_ldo7: LDO7 { regulator-name = "RC5T619_LDO7"; };
+			rc5t619_ldo8: LDO8 { regulator-name = "RC5T619_LDO8"; };
+			rc5t619_ldo9: LDO9 { regulator-name = "RC5T619_LDO9"; };
+			rc5t619_ldo10: LDO10 { regulator-name = "RC5T619_LDO10"; };
+			LDORTC1 {
+				regulator-name = "RC5T619_LDORTC1";
+				regulator-boot-on;
+				regulator-always-on;
+			};
+			LDORTC2 { regulator-name = "RC5T619_LDORTC2"; };
+		};
+	};
+};
+
+/* External inputs documented by the Tolino Epos RC5T619 board file. */
+&reg_arm {
+	vin-supply = <&rc5t619_dc3>;
+};
+
+&reg_soc {
+	vin-supply = <&rc5t619_dc1>;
+};
+
+&reg_pu {
+	vin-supply = <&rc5t619_dc1>;
+};
+
+/*
+ * Stock E70Q10 exposes this as "TP_3V3_ON" and holds it physically low.
+ * The published Netronix mx6sl board file does the same for keypad type 23.
+ */
+&gpio4 {
+	touch-power-hog {
+		gpio-hog;
+		gpios = <3 GPIO_ACTIVE_HIGH>;
+		output-low;
+		line-name = "TP_3V3_ON";
+	};
+};
+
+&iomuxc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_hog>;
+
+	imx6sl-e70q10 {
+		pinctrl_hog: hoggrp {
+			fsl,pins = <
+				MX6SL_PAD_KEY_COL0__GPIO3_IO24 0x17059 /* TP power */
+				/*
+				 * Netronix uses NO_PAD_CTRL here.  Preserve the
+				 * bootloader electrical setting and only select GPIO.
+				 */
+				MX6SL_PAD_KEY_ROW5__GPIO4_IO03 0x80000000
+			>;
+		};
+
+		pinctrl_uart1: uart1grp {
+			fsl,pins = <
+				MX6SL_PAD_UART1_RXD__UART1_RX_DATA 0x1b0b1
+				MX6SL_PAD_UART1_TXD__UART1_TX_DATA 0x1b0b1
+			>;
+		};
+
+		pinctrl_i2c2: i2c2grp {
+			fsl,pins = <
+				/* Stock E70Q10: SION + 22K pull-up, 0x1f8b1. */
+				MX6SL_PAD_I2C2_SCL__I2C2_SCL 0x4001f8b1
+				MX6SL_PAD_I2C2_SDA__I2C2_SDA 0x4001f8b1
+			>;
+		};
+
+		pinctrl_i2c3: i2c3grp {
+			fsl,pins = <
+				MX6SL_PAD_REF_CLK_24M__I2C3_SCL 0x4001b8b1
+				MX6SL_PAD_REF_CLK_32K__I2C3_SDA 0x4001b8b1
+			>;
+		};
+
+		pinctrl_touch: touchgrp {
+			fsl,pins = <
+				/* Match Netronix MX6SL_UART_PAD_CTRL exactly. */
+				MX6SL_PAD_SD1_DAT3__GPIO5_IO06 0x1b0b1
+				MX6SL_PAD_SD1_DAT2__GPIO5_IO13 0x1b0b1
+			>;
+		};
+
+		pinctrl_ricoh_irq: ricohirqgrp {
+			fsl,pins = <MX6SL_PAD_SD1_DAT0__GPIO5_IO11 0x1b0b0>;
+		};
+
+		pinctrl_wifi_ctrl: wifictrlgrp {
+			fsl,pins = <
+				MX6SL_PAD_SD2_DAT7__GPIO5_IO00 0x17059
+				MX6SL_PAD_SD2_DAT5__GPIO4_IO31 0x1b0b0
+			>;
+		};
+
+		pinctrl_keys: keysgrp {
+			fsl,pins = <
+				MX6SL_PAD_KEY_COL1__GPIO3_IO26 0x1b0b0
+				MX6SL_PAD_KEY_COL3__GPIO3_IO30 0x1b0b0
+				MX6SL_PAD_KEY_COL4__GPIO4_IO00 0x1b0b0
+				MX6SL_PAD_KEY_COL5__GPIO4_IO02 0x1b0b0
+				MX6SL_PAD_SD1_DAT1__GPIO5_IO08 0x1b0b0
+				MX6SL_PAD_SD1_DAT4__GPIO5_IO12 0x1b0b0
+			>;
+		};
+
+		pinctrl_epd_pmic: epdpmicgrp {
+			fsl,pins = <
+				MX6SL_PAD_EPDC_VCOM0__GPIO2_IO03 0x17059
+				MX6SL_PAD_EPDC_PWRCTRL0__GPIO2_IO07 0x17059
+				MX6SL_PAD_EPDC_PWRCTRL1__GPIO2_IO08 0x17059
+				MX6SL_PAD_EPDC_PWRCTRL2__GPIO2_IO09 0x1b0b0
+				MX6SL_PAD_EPDC_PWRSTAT__GPIO2_IO13 0x1b0b0
+				MX6SL_PAD_EPDC_PWRWAKEUP__GPIO2_IO14 0x17059
+			>;
+		};
+
+		pinctrl_epdc: epdcgrp {
+			fsl,pins = <
+				/* Exact MX6SL_EPDC_PAD_CTRL from the Netronix 3.0 tree:
+				 * HYS | PKE | SPEED_MED | DSE_40ohm.  E70Q10 hwcfg has
+				 * EPD_LV=0, so the LVE bit must remain clear.
+				 */
+				MX6SL_PAD_EPDC_D0__EPDC_DATA00 0x110b0
+				MX6SL_PAD_EPDC_D1__EPDC_DATA01 0x110b0
+				MX6SL_PAD_EPDC_D2__EPDC_DATA02 0x110b0
+				MX6SL_PAD_EPDC_D3__EPDC_DATA03 0x110b0
+				MX6SL_PAD_EPDC_D4__EPDC_DATA04 0x110b0
+				MX6SL_PAD_EPDC_D5__EPDC_DATA05 0x110b0
+				MX6SL_PAD_EPDC_D6__EPDC_DATA06 0x110b0
+				MX6SL_PAD_EPDC_D7__EPDC_DATA07 0x110b0
+				MX6SL_PAD_EPDC_D8__EPDC_DATA08 0x110b0
+				MX6SL_PAD_EPDC_D9__EPDC_DATA09 0x110b0
+				MX6SL_PAD_EPDC_D10__EPDC_DATA10 0x110b0
+				MX6SL_PAD_EPDC_D11__EPDC_DATA11 0x110b0
+				MX6SL_PAD_EPDC_D12__EPDC_DATA12 0x110b0
+				MX6SL_PAD_EPDC_D13__EPDC_DATA13 0x110b0
+				MX6SL_PAD_EPDC_D14__EPDC_DATA14 0x110b0
+				MX6SL_PAD_EPDC_D15__EPDC_DATA15 0x110b0
+				MX6SL_PAD_EPDC_GDCLK__EPDC_GDCLK 0x110b0
+				MX6SL_PAD_EPDC_GDSP__EPDC_GDSP 0x110b0
+				MX6SL_PAD_EPDC_GDOE__EPDC_GDOE 0x110b0
+				MX6SL_PAD_EPDC_GDRL__EPDC_GDRL 0x110b0
+				MX6SL_PAD_EPDC_SDCLK__EPDC_SDCLK_P 0x110b0
+				MX6SL_PAD_EPDC_SDOE__EPDC_SDOE 0x110b0
+				MX6SL_PAD_EPDC_SDLE__EPDC_SDLE 0x110b0
+				MX6SL_PAD_EPDC_SDSHR__EPDC_SDSHR 0x110b0
+				MX6SL_PAD_EPDC_BDR0__EPDC_BDR0 0x110b0
+				MX6SL_PAD_EPDC_SDCE0__EPDC_SDCE0 0x110b0
+				MX6SL_PAD_EPDC_SDCE1__EPDC_SDCE1 0x110b0
+			>;
+		};
+
+		pinctrl_usdhc2: usdhc2grp {
+			fsl,pins = <
+				MX6SL_PAD_SD2_CMD__SD2_CMD 0x17059
+				MX6SL_PAD_SD2_CLK__SD2_CLK 0x10059
+				MX6SL_PAD_SD2_DAT0__SD2_DATA0 0x17059
+				MX6SL_PAD_SD2_DAT1__SD2_DATA1 0x17059
+				MX6SL_PAD_SD2_DAT2__SD2_DATA2 0x17059
+				MX6SL_PAD_SD2_DAT3__SD2_DATA3 0x17059
+				MX6SL_PAD_SD2_DAT4__GPIO5_IO02 0x1b0b0
+			>;
+		};
+
+		pinctrl_usdhc3: usdhc3grp {
+			fsl,pins = <
+				MX6SL_PAD_SD3_CMD__SD3_CMD 0x17059
+				MX6SL_PAD_SD3_CLK__SD3_CLK 0x10059
+				MX6SL_PAD_SD3_DAT0__SD3_DATA0 0x17059
+				MX6SL_PAD_SD3_DAT1__SD3_DATA1 0x17059
+				MX6SL_PAD_SD3_DAT2__SD3_DATA2 0x17059
+				MX6SL_PAD_SD3_DAT3__SD3_DATA3 0x17059
+			>;
+		};
+
+		pinctrl_usdhc4: usdhc4grp {
+			fsl,pins = <
+				MX6SL_PAD_FEC_MDIO__SD4_CLK 0x10059
+				MX6SL_PAD_FEC_TX_CLK__SD4_CMD 0x17059
+				MX6SL_PAD_FEC_RX_ER__SD4_DATA0 0x17059
+				MX6SL_PAD_FEC_CRS_DV__SD4_DATA1 0x17059
+				MX6SL_PAD_FEC_RXD1__SD4_DATA2 0x17059
+				MX6SL_PAD_FEC_TXD0__SD4_DATA3 0x17059
+				MX6SL_PAD_FEC_MDC__SD4_DATA4 0x17059
+				MX6SL_PAD_FEC_RXD0__SD4_DATA5 0x17059
+				MX6SL_PAD_FEC_TX_EN__SD4_DATA6 0x17059
+				MX6SL_PAD_FEC_TXD1__SD4_DATA7 0x17059
+			>;
+		};
+	};
+};
+
+&pxp {
+	status = "okay";
+};
+
+&snvs_poweroff {
+	status = "okay";
+};
+
+&uart1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_uart1>;
+	status = "okay";
+};
+
+&usbotg1 {
+	dr_mode = "otg";
+	disable-over-current;
+	status = "okay";
+};
+
+&usdhc2 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_usdhc2>;
+	bus-width = <4>;
+	cd-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+	no-1-8-v;
+	status = "okay";
+};
+
+&usdhc3 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_usdhc3>;
+	bus-width = <4>;
+	non-removable;
+	keep-power-in-suspend;
+	enable-sdio-wakeup;
+	mmc-pwrseq = <&wifi_pwrseq>;
+	status = "okay";
+};
+
+&usdhc4 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_usdhc4>;
+	bus-width = <8>;
+	non-removable;
+	no-1-8-v;
+	status = "okay";
+};
