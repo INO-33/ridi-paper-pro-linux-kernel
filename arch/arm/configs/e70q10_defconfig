@@ -45,6 +45,20 @@ CONFIG_MXC_REBOOT_ANDROID_CMD=y
 CONFIG_MACH_IMX_BLUETOOTH_RFKILL=y
 # CONFIG_SWP_EMULATE is not set
 CONFIG_SMP=y
+# i.MX6SL has a single Cortex-A9 (imx6sl.dtsi declares only cpu@0), but the
+# arch/arm default is NR_CPUS=4, so every per-cpu allocation is sized for three
+# cores that do not exist. 2 is the floor while SMP is on (arch/arm/Kconfig
+# "range 2 32 depends on SMP").
+#
+# SMP itself stays enabled on purpose: CONFIG_SMP_ON_UP=y makes the kernel patch
+# out the SMP-only instruction sequences at boot when it finds uniprocessor
+# hardware, so the usual "SMP kernel on one core" penalty is already handled,
+# and turning SMP off would be a far riskier change to the i.MX6 platform code.
+#
+# CONFIG_HOTPLUG_CPU cannot be turned off here even though it is dead code on a
+# single core: kernel/power/Kconfig has PM_SLEEP_SMP as def_bool y selecting
+# HOTPLUG_CPU, and this device needs PM_SLEEP for suspend.
+CONFIG_NR_CPUS=2
 CONFIG_PREEMPT=y
 CONFIG_AEABI=y
 CONFIG_HIGHMEM=y
@@ -57,7 +71,28 @@ CONFIG_ARM_ATAG_DTB_COMPAT=y
 CONFIG_ARM_ATAG_DTB_COMPAT_CMDLINE_EXTEND=y
 CONFIG_CMDLINE="noinitrd console=ttymxc0,115200"
 CONFIG_CPU_FREQ=y
-CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND=y
+# Diagnostics for the governor work. Without this there is no
+# cpu0/cpufreq/stats/time_in_state, so the only way to tell whether the clock
+# actually rises is to poll scaling_cur_freq. The stock 4.4.2 kernel shipped
+# with this enabled (CONFIG_CPU_FREQ_STAT=y in its /proc/config.gz).
+CONFIG_CPU_FREQ_STAT=y
+# Restore the stock default governor.
+#
+# The 4.4.2 firmware RIDI shipped on this exact hardware built with
+# CONFIG_CPU_FREQ_DEFAULT_GOV_INTERACTIVE=y; this port had regressed to
+# ondemand, which on a single Cortex-A9 with a 61 us clock-latency resolves to a
+# 61 ms sampling period and an up_threshold of 95.
+#
+# Setting the default here rather than relying only on the init.E70Q10.rc write
+# means interactive governs from the moment cpufreq registers the policy, so
+# early boot is not spent on ondemand and the result no longer depends on that
+# sysfs write succeeding.
+CONFIG_CPU_FREQ_DEFAULT_GOV_INTERACTIVE=y
+# Keep ondemand built even though it is no longer the default. It used to be
+# pulled in by CONFIG_CPU_FREQ_DEFAULT_GOV_ONDEMAND selecting it; nothing selects
+# it now, and PERF_TUNING_ROLLBACK.md relies on being able to switch back at
+# runtime with `echo ondemand > .../scaling_governor` for an A/B comparison.
+CONFIG_CPU_FREQ_GOV_ONDEMAND=y
 CONFIG_CPU_FREQ_GOV_POWERSAVE=y
 CONFIG_CPU_FREQ_GOV_USERSPACE=y
 CONFIG_CPU_FREQ_GOV_CONSERVATIVE=y
@@ -92,6 +127,7 @@ CONFIG_INET_ESP=y
 # CONFIG_INET_XFRM_MODE_TRANSPORT is not set
 # CONFIG_INET_XFRM_MODE_BEET is not set
 CONFIG_INET_DIAG_DESTROY=y
+CONFIG_IPV6=y
 CONFIG_IPV6_ROUTER_PREF=y
 CONFIG_IPV6_ROUTE_INFO=y
 CONFIG_IPV6_OPTIMISTIC_DAD=y
@@ -441,6 +477,7 @@ CONFIG_LCD_L4F00242T03=m
 CONFIG_LCD_PLATFORM=m
 CONFIG_BACKLIGHT_PWM=y
 CONFIG_BACKLIGHT_GPIO=y
+CONFIG_BACKLIGHT_LM3630A=y
 CONFIG_FRAMEBUFFER_CONSOLE=y
 CONFIG_LOGO=y
 CONFIG_SOUND=y
@@ -579,7 +616,8 @@ CONFIG_RTC_CLASS=y
 CONFIG_RTC_INTF_DEV_UIE_EMUL=y
 CONFIG_RTC_DRV_MC13XXX=y
 CONFIG_RTC_DRV_MXC=y
-CONFIG_RTC_DRV_SNVS=y
+CONFIG_RTC_DRV_RICOH619=y
+# CONFIG_RTC_DRV_SNVS is not set
 CONFIG_DMADEVICES=y
 CONFIG_FSL_EDMA=y
 CONFIG_IMX_SDMA=y
@@ -676,6 +714,11 @@ CONFIG_CRYPTO_WP512=y
 CONFIG_CRYPTO_BLOWFISH=y
 CONFIG_CRYPTO_CAMELLIA=y
 CONFIG_CRYPTO_TWOFISH=y
+# zram compressor. CONFIG_ZRAM selects CRYPTO_LZO, which is what zram falls back
+# to, but lz4 decompresses several times faster and this SoC has a single core
+# that has to service every swap-in. init.E70Q10.rc selects it by writing
+# /sys/block/zram0/comp_algorithm before disksize is set.
+CONFIG_CRYPTO_LZ4=y
 CONFIG_CRYPTO_DEV_FSL_CAAM=y
 CONFIG_CRYPTO_DEV_FSL_CAAM_SM=y
 CONFIG_CRYPTO_DEV_FSL_CAAM_SM_TEST=y
@@ -688,3 +731,5 @@ CONFIG_CRC7=y
 CONFIG_FONTS=y
 CONFIG_FONT_8x8=y
 CONFIG_FONT_8x16=y
+
+CONFIG_RN5T618_POWER=y

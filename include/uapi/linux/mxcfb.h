@@ -110,6 +110,17 @@ struct mxcfb_rect {
 #define EPDC_FLAG_USE_DITHERING_Y4		0x4000
 #define EPDC_FLAG_USE_REGAL				0x8000
 
+/* E70Q10 sleep-frame metadata carried only in mxcfb_update_data.flags. */
+#define EPDC_FLAG_E70Q10_SLEEP_SCREEN		0x00010000
+#define EPDC_E70Q10_SLEEP_SEQUENCE_SHIFT	17
+#define EPDC_E70Q10_SLEEP_SEQUENCE_MASK		0x7FFE0000U
+#define EPDC_E70Q10_SLEEP_TAG_MASK		\
+	(EPDC_FLAG_E70Q10_SLEEP_SCREEN | EPDC_E70Q10_SLEEP_SEQUENCE_MASK)
+#define EPDC_E70Q10_SLEEP_SEQUENCE(flags)	\
+	(((flags) & EPDC_E70Q10_SLEEP_SEQUENCE_MASK) >> \
+	 EPDC_E70Q10_SLEEP_SEQUENCE_SHIFT)
+#define MXCFB_E70Q10_MAX_SLEEP_MARKERS		12
+
 enum mxcfb_dithering_mode {
 	EPDC_FLAG_USE_DITHERING_PASSTHROUGH = 0x0,
 	EPDC_FLAG_USE_DITHERING_FLOYD_STEINBERG,
@@ -143,6 +154,12 @@ struct mxcfb_update_data {
 struct mxcfb_update_marker_data {
 	__u32 update_marker;
 	__u32 collision_test;
+};
+
+struct mxcfb_e70q10_sleep_barrier {
+	__u32 sequence;
+	__u32 marker_count;
+	__u32 markers[MXCFB_E70Q10_MAX_SLEEP_MARKERS];
 };
 
 /*
@@ -207,6 +224,8 @@ struct mxcfb_buffer {
 #define MXCFB_GET_WORK_BUFFER		_IOWR('F', 0x34, unsigned long)
 #define MXCFB_DISABLE_EPDC_ACCESS	_IO('F', 0x35)
 #define MXCFB_ENABLE_EPDC_ACCESS	_IO('F', 0x36)
+#define MXCFB_E70Q10_WAIT_SLEEP_BARRIER	\
+	_IOW('F', 0x39, struct mxcfb_e70q10_sleep_barrier)
 
 // update screen interface.
 #define MXCFB_UPDATE_SCREEN	_IOW('F', 0x100, struct mxcfb_buffer)

@@ -17,6 +17,8 @@
 #include <linux/interrupt.h>
 #include <linux/regmap.h>
 #include <linux/pwm.h>
+#include <linux/of.h>
+#include <linux/mutex.h>
 #include <linux/platform_data/lm3630a_bl.h>
 
 #define REG_CTRL	0x00
@@ -31,7 +33,14 @@
 #define REG_FAULT	0x0B
 #define REG_PWM_OUTLOW	0x12
 #define REG_PWM_OUTHIGH	0x13
-#define REG_MAX		0x1F
+#define REG_REV		0x1F
+#define REG_FILTER_STRENGTH	0x50
+#define REG_MAX		REG_FILTER_STRENGTH
+
+#define E70Q10_MAX_BRIGHTNESS	100
+#define E70Q10_MAX_COLOR	10
+#define E70Q10_CURRENT_A	4
+#define E70Q10_CURRENT_B	7
 
 #define INT_DEBOUNCE_MSEC	10
 struct lm3630a_chip {
@@ -43,8 +52,32 @@ struct lm3630a_chip {
 	struct lm3630a_platform_data *pdata;
 	struct backlight_device *bleda;
 	struct backlight_device *bledb;
+	struct backlight_device *bled;
 	struct regmap *regmap;
 	struct pwm_device *pwmd;
+	struct mutex lock;
+	u8 color;
+	u8 current_a;
+	u8 current_b;
+};
+
+/*
+ * Verified channel-A curve from the public Netronix/Tolino Epos driver.
+ * Keep the stock current limits (A=4, B=7).  Exact optical calibration can
+ * later replace only the two-colour mix table.
+ */
+static const u8 e70q10_brightness_lut[E70Q10_MAX_BRIGHTNESS + 1] = {
+	0,
+	43, 66, 79, 90, 96, 107, 114, 120, 126, 132,
+	135, 139, 143, 145, 147, 150, 152, 154, 156, 158,
+	160, 163, 165, 168, 170, 172, 174, 176, 178, 180,
+	181, 183, 185, 186, 188, 190, 191, 192, 193, 194,
+	195, 196, 197, 198, 199, 200, 201, 202, 203, 204,
+	205, 206, 207, 208, 209, 210, 211, 212, 213, 214,
+	215, 216, 217, 218, 219, 220, 221, 222, 223, 224,
+	225, 226, 227, 228, 229, 230, 231, 232, 233, 234,
+	235, 236, 237, 238, 239, 240, 241, 242, 243, 244,
+	245, 246, 247, 248, 249, 250, 251, 252, 253, 254,
 };
 
 /* i2c access */
@@ -76,26 +109,20 @@ static int lm3630a_update(struct lm3630a_chip *pchip,
 static int lm3630a_chip_init(struct lm3630a_chip *pchip)
 {
 	int rval;
-	struct lm3630a_platform_data *pdata = pchip->pdata;
 
 	usleep_range(1000, 2000);
-	/* set Filter Strength Register */
-	rval = lm3630a_write(pchip, 0x50, 0x03);
-	/* set Cofig. register */
-	rval |= lm3630a_update(pchip, REG_CONFIG, 0x07, pdata->pwm_ctrl);
-	/* set boost control */
-	rval |= lm3630a_write(pchip, REG_BOOST, 0x38);
-	/* set current A */
-	rval |= lm3630a_update(pchip, REG_I_A, 0x1F, 0x1F);
-	/* set current B */
-	rval |= lm3630a_write(pchip, REG_I_B, 0x1F);
-	/* set control */
-	rval |= lm3630a_update(pchip, REG_CTRL, 0x14, pdata->leda_ctrl);
-	rval |= lm3630a_update(pchip, REG_CTRL, 0x0B, pdata->ledb_ctrl);
-	usleep_range(1000, 2000);
-	/* set brightness A and B */
-	rval |= lm3630a_write(pchip, REG_BRT_A, pdata->leda_init_brt);
-	rval |= lm3630a_write(pchip, REG_BRT_B, pdata->ledb_init_brt);
+	/*
+	 * Values captured from an untouched RIDI 4.4.2 boot.  Keep both LED
+	 * banks disabled during probe; userspace explicitly turns the light on.
+	 */
+	rval = lm3630a_write(pchip, REG_FILTER_STRENGTH, 0x03);
+	rval |= lm3630a_write(pchip, REG_CONFIG, 0x18);
+	rval |= lm3630a_write(pchip, REG_BOOST, 0x63);
+	rval |= lm3630a_write(pchip, REG_I_A, 0);
+	rval |= lm3630a_write(pchip, REG_I_B, 0);
+	rval |= lm3630a_write(pchip, REG_BRT_A, 0);
+	rval |= lm3630a_write(pchip, REG_BRT_B, 0);
+	rval |= lm3630a_write(pchip, REG_CTRL, 0);
 
 	if (rval < 0)
 		dev_err(pchip->dev, "i2c failed to access register\n");
@@ -326,11 +353,139 @@ static const struct backlight_ops lm3630a_bank_b_ops = {
 	.get_brightness = lm3630a_bank_b_get_brightness,
 };
 
+static int e70q10_frontlight_apply(struct lm3630a_chip *pchip,
+				   unsigned int brightness)
+{
+	unsigned int level_a, level_b;
+	u8 duty_a = 0, duty_b = 0, ctrl = 0;
+	int ret;
+
+	if (brightness > E70Q10_MAX_BRIGHTNESS)
+		brightness = E70Q10_MAX_BRIGHTNESS;
+
+	if (brightness) {
+		/*
+		 * Split the requested *level* between the two banks instead of
+		 * splitting the PWM code.
+		 *
+		 * e70q10_brightness_lut[] is a strongly compressive curve
+		 * (level 1 already maps to code 43), so scaling the code by the
+		 * colour weight removes far more light than the weight implies.
+		 * Mixing in the code domain therefore made every colour-
+		 * temperature change look like a brightness change, with the
+		 * largest loss in the middle of the colour range.
+		 *
+		 * Because level_a + level_b == brightness for every colour
+		 * value, the combined output now stays on the level the user
+		 * asked for, and both end points keep their stock single-bank
+		 * code.  The per-bank current limits stay at their calibrated
+		 * values, so the mix only shifts colour temperature.
+		 */
+		level_b = DIV_ROUND_CLOSEST(brightness * pchip->color,
+					    E70Q10_MAX_COLOR);
+		level_a = brightness - level_b;
+
+		if (level_a) {
+			duty_a = e70q10_brightness_lut[level_a];
+			ctrl |= LM3630A_LEDA_ENABLE;
+		}
+		if (level_b) {
+			duty_b = e70q10_brightness_lut[level_b];
+			ctrl |= LM3630A_LEDB_ENABLE;
+		}
+	}
+
+	mutex_lock(&pchip->lock);
+	ret = lm3630a_update(pchip, REG_CTRL, 0x80, 0);
+	if (!ret)
+		usleep_range(1000, 2000);
+	if (!ret)
+		ret = lm3630a_write(pchip, REG_BRT_A, duty_a);
+	if (!ret)
+		ret = lm3630a_write(pchip, REG_BRT_B, duty_b);
+	if (!ret)
+		ret = lm3630a_write(pchip, REG_I_A,
+				    duty_a ? pchip->current_a : 0);
+	if (!ret)
+		ret = lm3630a_write(pchip, REG_I_B,
+				    duty_b ? pchip->current_b : 0);
+	if (!ret)
+		ret = lm3630a_update(pchip, REG_CTRL,
+				    LM3630A_LEDA_ENABLE |
+				    LM3630A_LEDB_ENABLE, ctrl);
+	mutex_unlock(&pchip->lock);
+
+	return ret;
+}
+
+static int e70q10_frontlight_update_status(struct backlight_device *bl)
+{
+	struct lm3630a_chip *pchip = bl_get_data(bl);
+	unsigned int brightness = bl->props.brightness;
+	int ret;
+
+	if (bl->props.power != FB_BLANK_UNBLANK ||
+	    bl->props.state & (BL_CORE_FBBLANK | BL_CORE_SUSPENDED))
+		brightness = 0;
+
+	ret = e70q10_frontlight_apply(pchip, brightness);
+	return ret < 0 ? ret : 0;
+}
+
+static int e70q10_frontlight_get_brightness(struct backlight_device *bl)
+{
+	return bl->props.brightness;
+}
+
+static const struct backlight_ops e70q10_frontlight_ops = {
+	.options = BL_CORE_SUSPENDRESUME,
+	.update_status = e70q10_frontlight_update_status,
+	.get_brightness = e70q10_frontlight_get_brightness,
+};
+
+static ssize_t color_show(struct device *dev, struct device_attribute *attr,
+			  char *buf)
+{
+	struct backlight_device *bl = to_backlight_device(dev);
+	struct lm3630a_chip *pchip = bl_get_data(bl);
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", pchip->color);
+}
+
+static ssize_t color_store(struct device *dev, struct device_attribute *attr,
+			   const char *buf, size_t count)
+{
+	struct backlight_device *bl = to_backlight_device(dev);
+	struct lm3630a_chip *pchip = bl_get_data(bl);
+	unsigned int color;
+	int ret;
+
+	ret = kstrtouint(buf, 0, &color);
+	if (ret)
+		return ret;
+	if (color > E70Q10_MAX_COLOR)
+		return -ERANGE;
+
+	pchip->color = color;
+	ret = backlight_update_status(bl);
+	return ret < 0 ? ret : count;
+}
+static DEVICE_ATTR_RW(color);
+
+static ssize_t max_color_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n", E70Q10_MAX_COLOR);
+}
+static DEVICE_ATTR_RO(max_color);
+
 static int lm3630a_backlight_register(struct lm3630a_chip *pchip)
 {
 	struct backlight_properties props;
 	struct lm3630a_platform_data *pdata = pchip->pdata;
+	int ret;
 
+	memset(&props, 0, sizeof(props));
 	props.type = BACKLIGHT_RAW;
 	if (pdata->leda_ctrl != LM3630A_LEDA_DISABLE) {
 		props.brightness = pdata->leda_init_brt;
@@ -354,6 +509,28 @@ static int lm3630a_backlight_register(struct lm3630a_chip *pchip)
 		if (IS_ERR(pchip->bledb))
 			return PTR_ERR(pchip->bledb);
 	}
+
+	memset(&props, 0, sizeof(props));
+	props.type = BACKLIGHT_RAW;
+	props.max_brightness = E70Q10_MAX_BRIGHTNESS;
+	props.brightness = 0;
+	pchip->bled = devm_backlight_device_register(pchip->dev,
+						     "lm3630a_led",
+						     pchip->dev, pchip,
+						     &e70q10_frontlight_ops,
+						     &props);
+	if (IS_ERR(pchip->bled))
+		return PTR_ERR(pchip->bled);
+
+	ret = device_create_file(&pchip->bled->dev, &dev_attr_color);
+	if (ret)
+		return ret;
+	ret = device_create_file(&pchip->bled->dev, &dev_attr_max_color);
+	if (ret)
+		device_remove_file(&pchip->bled->dev, &dev_attr_color);
+	if (ret)
+		return ret;
+
 	return 0;
 }
 
@@ -380,6 +557,20 @@ static int lm3630a_probe(struct i2c_client *client,
 	if (!pchip)
 		return -ENOMEM;
 	pchip->dev = &client->dev;
+	mutex_init(&pchip->lock);
+	pchip->current_a = E70Q10_CURRENT_A;
+	pchip->current_b = E70Q10_CURRENT_B;
+	pchip->color = 0;
+
+	of_property_read_u8(client->dev.of_node, "ridi,current-a",
+			    &pchip->current_a);
+	of_property_read_u8(client->dev.of_node, "ridi,current-b",
+			    &pchip->current_b);
+	if (pchip->current_a > 0x1f || pchip->current_b > 0x1f) {
+		dev_err(&client->dev,
+			"frontlight current exceeds LM3630A limit\n");
+		return -EINVAL;
+	}
 
 	pchip->regmap = devm_regmap_init_i2c(client, &lm3630a_regmap);
 	if (IS_ERR(pchip->regmap)) {
@@ -400,8 +591,8 @@ static int lm3630a_probe(struct i2c_client *client,
 		pdata->ledb_ctrl = LM3630A_LEDB_ENABLE;
 		pdata->leda_max_brt = LM3630A_MAX_BRIGHTNESS;
 		pdata->ledb_max_brt = LM3630A_MAX_BRIGHTNESS;
-		pdata->leda_init_brt = LM3630A_MAX_BRIGHTNESS;
-		pdata->ledb_init_brt = LM3630A_MAX_BRIGHTNESS;
+		pdata->leda_init_brt = 0;
+		pdata->ledb_init_brt = 0;
 	}
 	pchip->pdata = pdata;
 
@@ -448,6 +639,7 @@ static int lm3630a_remove(struct i2c_client *client)
 	int rval;
 	struct lm3630a_chip *pchip = i2c_get_clientdata(client);
 
+	e70q10_frontlight_apply(pchip, 0);
 	rval = lm3630a_write(pchip, REG_BRT_A, 0);
 	if (rval < 0)
 		dev_err(pchip->dev, "i2c failed to access register\n");
@@ -455,6 +647,11 @@ static int lm3630a_remove(struct i2c_client *client)
 	rval = lm3630a_write(pchip, REG_BRT_B, 0);
 	if (rval < 0)
 		dev_err(pchip->dev, "i2c failed to access register\n");
+
+	if (pchip->bled) {
+		device_remove_file(&pchip->bled->dev, &dev_attr_max_color);
+		device_remove_file(&pchip->bled->dev, &dev_attr_color);
+	}
 
 	if (pchip->irq) {
 		free_irq(pchip->irq, pchip);
@@ -464,19 +661,35 @@ static int lm3630a_remove(struct i2c_client *client)
 	return 0;
 }
 
+static void lm3630a_shutdown(struct i2c_client *client)
+{
+	struct lm3630a_chip *pchip = i2c_get_clientdata(client);
+
+	e70q10_frontlight_apply(pchip, 0);
+}
+
 static const struct i2c_device_id lm3630a_id[] = {
 	{LM3630A_NAME, 0},
+	{"lm3630a", 0},
 	{}
 };
 
 MODULE_DEVICE_TABLE(i2c, lm3630a_id);
 
+static const struct of_device_id lm3630a_of_match[] = {
+	{ .compatible = "ti,lm3630a" },
+	{ }
+};
+MODULE_DEVICE_TABLE(of, lm3630a_of_match);
+
 static struct i2c_driver lm3630a_i2c_driver = {
 	.driver = {
 		   .name = LM3630A_NAME,
+		   .of_match_table = lm3630a_of_match,
 		   },
 	.probe = lm3630a_probe,
 	.remove = lm3630a_remove,
+	.shutdown = lm3630a_shutdown,
 	.id_table = lm3630a_id,
 };
 

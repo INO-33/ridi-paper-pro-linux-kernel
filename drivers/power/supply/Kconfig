@@ -525,4 +525,13 @@ config SABRESD_MAX8903
          sabresd board.The driver supports controlling charger and battery
          based on the status of charger connections with interrupt handlers.
 
+
+config RN5T618_POWER
+	tristate "RN5T618/RC5T619 charger/fuel gauge support"
+	depends on MFD_RN5T618
+	help
+	  Say Y here to register the RN5T618/RC5T619 battery, adapter and USB
+	  power supplies.  The E70Q10 backport uses polling notifications because
+	  this BSP predates the upstream RN5T618 regmap-IRQ support.
+
 endif # POWER_SUPPLY

@@ -23,6 +23,7 @@
  */
 
 #include <linux/clk.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/freezer.h>
@@ -69,6 +70,7 @@ struct pxps {
 #define	CLK_STAT_OFF		0
 #define	CLK_STAT_ON		1
 	int pxp_ongoing;
+	bool manual_recovering;
 	int lut_state;
 
 	struct device *dev;
@@ -87,6 +89,8 @@ struct pxps {
 	wait_queue_head_t thread_waitq;
 	struct completion complete;
 };
+
+static void pxp_issue_pending(struct dma_chan *chan);
 
 #define to_pxp_dma(d) container_of(d, struct pxp_dma, dma)
 #define to_tx_desc(tx) container_of(tx, struct pxp_tx_desc, txd)
@@ -1159,6 +1163,176 @@ static void pxp_clk_disable(struct pxps *pxp)
 	mutex_unlock(&pxp->clk_mutex);
 }
 
+void pxp_dump_state(struct dma_chan *chan, struct device *logdev)
+{
+	struct pxp_channel *pxp_chan;
+	struct pxp_dma *pxp_dma;
+	struct pxps *pxp;
+
+	if (!chan || !chan->device)
+		return;
+	pxp_chan = to_pxp_channel(chan);
+	pxp_dma = to_pxp_dma(pxp_chan->dma_chan.device);
+	pxp = to_pxp(pxp_dma);
+	pxp_clk_enable(pxp);
+	dev_err_ratelimited(logdev,
+		"PxP state: CTRL=%08x STAT=%08x LUT_CTRL=%08x OUT_BUF=%08x OUT_BUF2=%08x PITCH=%08x OUT_CTRL=%08x OUT_AS_ULC=%08x lut_state=%d\n",
+		__raw_readl(pxp->base + HW_PXP_CTRL),
+		__raw_readl(pxp->base + HW_PXP_STAT),
+		__raw_readl(pxp->base + HW_PXP_LUT_CTRL),
+		__raw_readl(pxp->base + HW_PXP_OUT_BUF),
+		__raw_readl(pxp->base + HW_PXP_OUT_BUF2),
+		__raw_readl(pxp->base + HW_PXP_OUT_PITCH),
+		__raw_readl(pxp->base + HW_PXP_OUT_CTRL),
+		__raw_readl(pxp->base + HW_PXP_OUT_AS_ULC),
+		pxp->lut_state);
+	pxp_clk_disable(pxp);
+}
+EXPORT_SYMBOL_GPL(pxp_dump_state);
+
+static int pxp_pm_begin_access(struct pxps *pxp)
+{
+	unsigned long flags;
+	int i;
+	int ret = 0;
+
+	spin_lock_irqsave(&pxp->lock, flags);
+	if (pxp->manual_recovering || pxp->pxp_ongoing || !list_empty(&head)) {
+		ret = -EBUSY;
+	} else {
+		pxp->manual_recovering = true;
+		/* Prevent the idle timer from gating PxP during register access. */
+		pxp->pxp_ongoing = 1;
+	}
+	spin_unlock_irqrestore(&pxp->lock, flags);
+	if (ret)
+		return ret;
+
+	/* Work queued on a virtual channel but not dispatched is not idle. */
+	for (i = 0; i < NR_PXP_VIRT_CHANNEL; i++) {
+		spin_lock_irqsave(&pxp->channel[i].lock, flags);
+		if (list_empty(&pxp->channel[i].queue)) {
+			spin_unlock_irqrestore(&pxp->channel[i].lock, flags);
+			continue;
+		}
+		spin_unlock_irqrestore(&pxp->channel[i].lock, flags);
+		spin_lock_irqsave(&pxp->lock, flags);
+		pxp->manual_recovering = false;
+		pxp->pxp_ongoing = 0;
+		spin_unlock_irqrestore(&pxp->lock, flags);
+		mod_timer(&pxp->clk_timer, jiffies + msecs_to_jiffies(timeout_in_ms));
+		for (i = 0; i < NR_PXP_VIRT_CHANNEL; i++)
+			pxp_issue_pending(&pxp->channel[i].dma_chan);
+		return -EBUSY;
+	}
+	return ret;
+}
+
+static void pxp_pm_end_access(struct pxps *pxp)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&pxp->lock, flags);
+	pxp->manual_recovering = false;
+	pxp->pxp_ongoing = 0;
+	spin_unlock_irqrestore(&pxp->lock, flags);
+	mod_timer(&pxp->clk_timer, jiffies + msecs_to_jiffies(timeout_in_ms));
+	/* issue_pending may have been deferred while manual access was active. */
+	for (i = 0; i < NR_PXP_VIRT_CHANNEL; i++)
+		pxp_issue_pending(&pxp->channel[i].dma_chan);
+}
+
+static void pxp_pm_read_regs(struct pxps *pxp, u32 regs[PXP_PM_TRACE_REGS])
+{
+	regs[0] = __raw_readl(pxp->base + HW_PXP_CTRL);
+	regs[1] = __raw_readl(pxp->base + HW_PXP_STAT);
+	regs[2] = __raw_readl(pxp->base + HW_PXP_LUT_CTRL);
+	regs[3] = __raw_readl(pxp->base + HW_PXP_OUT_BUF);
+	regs[4] = __raw_readl(pxp->base + HW_PXP_OUT_PITCH);
+	regs[5] = __raw_readl(pxp->base + HW_PXP_OUT_CTRL);
+	regs[6] = __raw_readl(pxp->base + HW_PXP_OUT_AS_ULC);
+}
+
+static struct pxps *pxp_from_dma_chan(struct dma_chan *chan)
+{
+	struct pxp_channel *pxp_chan;
+	struct pxp_dma *pxp_dma;
+
+	if (!chan || !chan->device)
+		return NULL;
+	pxp_chan = to_pxp_channel(chan);
+	pxp_dma = to_pxp_dma(pxp_chan->dma_chan.device);
+	return to_pxp(pxp_dma);
+}
+
+int pxp_pm_snapshot(struct dma_chan *chan, u32 regs[PXP_PM_TRACE_REGS])
+{
+	struct pxps *pxp = pxp_from_dma_chan(chan);
+	int ret;
+
+	if (!pxp || !regs)
+		return -EINVAL;
+	ret = pxp_pm_begin_access(pxp);
+	if (ret)
+		return ret;
+	pxp_clk_enable(pxp);
+	pxp_pm_read_regs(pxp, regs);
+	pxp_pm_end_access(pxp);
+	return 0;
+}
+EXPORT_SYMBOL_GPL(pxp_pm_snapshot);
+
+int pxp_pm_recover(struct dma_chan *chan, u32 regs[PXP_PM_TRACE_REGS])
+{
+	struct pxps *pxp = pxp_from_dma_chan(chan);
+	unsigned long timeout;
+	int ret;
+
+	if (!pxp || !regs)
+		return -EINVAL;
+	ret = pxp_pm_begin_access(pxp);
+	if (ret)
+		return ret;
+	pxp_clk_enable(pxp);
+
+	__raw_writel(BM_PXP_CTRL_SFTRST, pxp->base + HW_PXP_CTRL_CLR);
+	__raw_writel(BM_PXP_CTRL_CLKGATE, pxp->base + HW_PXP_CTRL_CLR);
+	__raw_writel(BM_PXP_CTRL_SFTRST, pxp->base + HW_PXP_CTRL_SET);
+	timeout = jiffies + msecs_to_jiffies(100);
+	while (!(__raw_readl(pxp->base + HW_PXP_CTRL) & BM_PXP_CTRL_CLKGATE)) {
+		if (time_after_eq(jiffies, timeout)) {
+			ret = -ETIMEDOUT;
+			goto out_release_reset;
+		}
+		udelay(1);
+	}
+	udelay(10);
+	__raw_writel(BM_PXP_CTRL_SFTRST, pxp->base + HW_PXP_CTRL_CLR);
+	__raw_writel(BM_PXP_CTRL_CLKGATE, pxp->base + HW_PXP_CTRL_CLR);
+	timeout = jiffies + msecs_to_jiffies(100);
+	while (__raw_readl(pxp->base + HW_PXP_CTRL) &
+	       (BM_PXP_CTRL_SFTRST | BM_PXP_CTRL_CLKGATE)) {
+		if (time_after_eq(jiffies, timeout)) {
+			ret = -ETIMEDOUT;
+			goto out_release_reset;
+		}
+		udelay(1);
+	}
+
+	pxp->lut_state = PXP_LUT_NONE;
+	__raw_writel(~0U, pxp->base + HW_PXP_OUT_AS_ULC);
+	ret = 0;
+
+out_release_reset:
+	/* SFTRST invalidates the hardware LUT even if release timed out. */
+	pxp->lut_state = PXP_LUT_NONE;
+	pxp_pm_read_regs(pxp, regs);
+	pxp_pm_end_access(pxp);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pxp_pm_recover);
+
 static inline void clkoff_callback(struct work_struct *w)
 {
 	struct pxps *pxp = container_of(w, struct pxps, work);
@@ -1247,7 +1421,7 @@ static void pxpdma_dostart_work(struct pxps *pxp)
 	spin_unlock_irqrestore(&pxp->lock, flags);
 }
 
-static void pxpdma_dequeue(struct pxp_channel *pxp_chan, struct pxps *pxp)
+static bool pxpdma_dequeue(struct pxp_channel *pxp_chan, struct pxps *pxp)
 {
 	unsigned long flags;
 	struct pxp_tx_desc *desc = NULL;
@@ -1255,9 +1429,14 @@ static void pxpdma_dequeue(struct pxp_channel *pxp_chan, struct pxps *pxp)
 	do {
 		desc = pxpdma_first_queued(pxp_chan);
 		spin_lock_irqsave(&pxp->lock, flags);
+		if (pxp->manual_recovering) {
+			spin_unlock_irqrestore(&pxp->lock, flags);
+			return false;
+		}
 		list_move_tail(&desc->list, &head);
 		spin_unlock_irqrestore(&pxp->lock, flags);
 	} while (!list_empty(&pxp_chan->queue));
+	return true;
 }
 
 static dma_cookie_t pxp_tx_submit(struct dma_async_tx_descriptor *tx)
@@ -1335,6 +1514,13 @@ static irqreturn_t pxp_irq(int irq, void *dev_id)
 	 * the PXP block to its default state.
 	 */
 	pxp_soft_reset(pxp);
+	/*
+	 * SFTRST also resets the hardware LUT to bypass.  Keeping the cached
+	 * lut_state here makes the next transaction with the same non-zero LUT
+	 * operation skip pxp_set_lut(), so P5N/AA receives unquantized Y8 after
+	 * the first frame.  Reflect the actual post-reset hardware state.
+	 */
+	pxp->lut_state = PXP_LUT_NONE;
 
 	spin_lock_irqsave(&pxp->lock, flags);
 
@@ -1356,10 +1542,16 @@ static irqreturn_t pxp_irq(int irq, void *dev_id)
 	/* Send histogram status back to caller */
 	desc->hist_status = hist_status;
 
+	/*
+	 * Publish the channel's completed state before invoking the DMA callback.
+	 * The EPDC callback wakes a waiter that may immediately release the channel;
+	 * writing INITIALIZED after that callback can overwrite FREE and make the
+	 * next dma_request_channel() trip pxp_alloc_chan_resources()'s WARN_ON.
+	 */
+	pxp_chan->status = PXP_CHANNEL_INITIALIZED;
+
 	if ((desc->txd.flags & DMA_PREP_INTERRUPT) && callback)
 		callback(callback_param);
-
-	pxp_chan->status = PXP_CHANNEL_INITIALIZED;
 
 	list_for_each_entry_safe(child, _child, &desc->tx_list, list) {
 		list_del_init(&child->list);
@@ -1485,7 +1677,10 @@ static void pxp_issue_pending(struct dma_chan *chan)
 		return;
 	}
 
-	pxpdma_dequeue(pxp_chan, pxp);
+	if (!pxpdma_dequeue(pxp_chan, pxp)) {
+		spin_unlock(&pxp_chan->lock);
+		return;
+	}
 	pxp_chan->status = PXP_CHANNEL_READY;
 
 	spin_unlock(&pxp_chan->lock);
@@ -1598,6 +1793,11 @@ static int pxp_dma_init(struct pxps *pxp)
 		struct dma_chan *dma_chan = &pxp_chan->dma_chan;
 
 		spin_lock_init(&pxp_chan->lock);
+		/* PM idle checks inspect and kick every virtual channel, including
+		 * channels that have never reached device_alloc_chan_resources().
+		 * A zeroed list head looks nonempty and would dispatch a NULL entry.
+		 */
+		INIT_LIST_HEAD(&pxp_chan->queue);
 
 		/* Only one EOF IRQ for PxP, shared by all channels */
 		pxp_chan->eof_irq = pxp->irq;
@@ -1700,11 +1900,20 @@ static int pxp_dispatch_thread(void *argv)
 		spin_unlock_irqrestore(&pxp->lock, flags);
 		init_completion(&pxp->complete);
 		pxpdma_dostart_work(pxp);
-		ret = wait_for_completion_timeout(&pxp->complete, 2 * HZ);
-		if (ret == 0) {
-			printk(KERN_EMERG "%s: task is timeout\n\n", __func__);
+		/*
+		 * A slow transaction must not kill the sole dispatch thread. Keep
+		 * waiting for the same hardware completion without restarting PxP; a
+		 * late IRQ can then finish the transaction and normal dispatch resumes.
+		 */
+		do {
+			ret = wait_for_completion_timeout(&pxp->complete, 2 * HZ);
+			if (!ret)
+				pr_err_ratelimited("%s: PxP task still active after 2 seconds\n",
+						   __func__);
+		} while (!ret && !kthread_should_stop());
+
+		if (kthread_should_stop())
 			break;
-		}
 	}
 
 	return 0;
@@ -1831,6 +2040,8 @@ static int pxp_suspend(struct device *dev)
 		;
 
 	__raw_writel(BM_PXP_CTRL_SFTRST, pxp->base + HW_PXP_CTRL);
+	/* SFTRST clears the hardware LUT, so discard the cached configuration. */
+	pxp->lut_state = PXP_LUT_NONE;
 	pxp_clk_disable(pxp);
 
 	return 0;
@@ -1843,6 +2054,9 @@ static int pxp_resume(struct device *dev)
 	pxp_clk_enable(pxp);
 	/* Pull PxP out of reset */
 	__raw_writel(0, pxp->base + HW_PXP_CTRL);
+	/* Match stock i.MX6SL resume state after the reset has been released. */
+	pxp->lut_state = PXP_LUT_NONE;
+	__raw_writel(~0U, pxp->base + HW_PXP_OUT_AS_ULC);
 	pxp_clk_disable(pxp);
 
 	return 0;

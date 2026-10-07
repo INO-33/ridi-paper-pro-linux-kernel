@@ -21,6 +21,9 @@
 
 #include <uapi/linux/pxp_dma.h>
 
+struct device;
+struct dma_chan;
+
 struct pxp_tx_desc {
 	struct dma_async_tx_descriptor txd;
 	struct list_head tx_list;
@@ -57,11 +60,16 @@ struct pxp_channel {
 	char eof_name[16];	/* EOF IRQ name for request_irq()  */
 };
 
+#define PXP_PM_TRACE_REGS	7
+
 #define to_tx_desc(tx) container_of(tx, struct pxp_tx_desc, txd)
 #define to_pxp_channel(d) container_of(d, struct pxp_channel, dma_chan)
 
 void pxp_txd_ack(struct dma_async_tx_descriptor *txd,
 		 struct pxp_channel *pxp_chan);
+void pxp_dump_state(struct dma_chan *chan, struct device *logdev);
+int pxp_pm_snapshot(struct dma_chan *chan, u32 regs[PXP_PM_TRACE_REGS]);
+int pxp_pm_recover(struct dma_chan *chan, u32 regs[PXP_PM_TRACE_REGS]);
 
 #ifdef CONFIG_MXC_PXP_CLIENT_DEVICE
 int register_pxp_device(void);

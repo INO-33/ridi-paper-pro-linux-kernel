@@ -203,6 +203,7 @@ struct imx_i2c_struct {
 	unsigned int		cur_clk;
 	unsigned int		bitrate;
 	bool			stock_transfer_clock_gating;
+	bool			shutdown_clock_prepared;
 	const struct imx_i2c_hwdata	*hwdata;
 	struct i2c_bus_recovery_info rinfo;
 
@@ -412,10 +413,18 @@ static void i2c_imx_dma_free(struct imx_i2c_struct *i2c_imx)
 	dma->chan_using = NULL;
 }
 
+static bool i2c_imx_polling_context(void)
+{
+	/* ARM machine_power_off disables IRQs without entering an IRQ handler. */
+	return in_atomic() || in_interrupt() || irqs_disabled();
+}
+
 static int i2c_imx_bus_busy(struct imx_i2c_struct *i2c_imx, int for_busy)
 {
 	unsigned long orig_jiffies = jiffies;
 	unsigned int temp;
+	bool polling = i2c_imx_polling_context();
+	int retry = 5001;
 
 	dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
 
@@ -433,12 +442,16 @@ static int i2c_imx_bus_busy(struct imx_i2c_struct *i2c_imx, int for_busy)
 			break;
 		if (!for_busy && !(temp & I2SR_IBB))
 			break;
-		if (time_after(jiffies, orig_jiffies + msecs_to_jiffies(500))) {
+		if ((polling && !--retry) || (!polling &&
+		    time_after(jiffies, orig_jiffies + msecs_to_jiffies(500)))) {
 			dev_dbg(&i2c_imx->adapter.dev,
 				"<%s> I2C bus is busy\n", __func__);
 			return -ETIMEDOUT;
 		}
-		schedule();
+		if (polling)
+			udelay(100);
+		else
+			schedule();
 	}
 
 	return 0;
@@ -451,12 +464,21 @@ static int i2c_imx_trx_complete(struct imx_i2c_struct *i2c_imx)
 	 * atomic/IRQ callers merge the live I2SR value into i2csr and poll
 	 * for up to roughly 500 ms.  Normal callers wait for 10 jiffies.
 	 */
-	if (in_atomic() || in_interrupt()) {
+	if (i2c_imx_polling_context()) {
 		int retry = 5001;
+		unsigned int status;
 
 		do {
-			i2c_imx->i2csr |=
-				imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
+			status = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2SR);
+			i2c_imx->i2csr |= status;
+			if (status & I2SR_IIF) {
+				/* Mirror the ISR: acknowledge each byte completion so
+				 * the next byte cannot consume the preceding byte's IIF.
+				 */
+				status &= ~I2SR_IIF;
+				status |= i2c_imx->hwdata->i2sr_clr_opcode & I2SR_IIF;
+				imx_i2c_write_reg(status, i2c_imx, IMX_I2C_I2SR);
+			}
 			if (i2c_imx->i2csr & I2SR_IIF)
 				break;
 			udelay(100);
@@ -540,7 +562,9 @@ static int i2c_imx_start(struct imx_i2c_struct *i2c_imx)
 
 	dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
 
-	i2c_imx_set_clk(i2c_imx);
+	/* clk_get_rate takes a sleeping lock; divider is frozen at shutdown. */
+	if (!i2c_imx->shutdown_clock_prepared)
+		i2c_imx_set_clk(i2c_imx);
 
 	imx_i2c_write_reg(i2c_imx->ifdr, i2c_imx, IMX_I2C_IFDR);
 	/* Enable I2C controller */
@@ -805,9 +829,6 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs, bo
 	int i, result;
 	unsigned int temp;
 	int block_data = msgs->flags & I2C_M_RECV_LEN;
-	u8 trace_sr[64], trace_cr[64], trace_data[64];
-	int trace_len = min_t(int, msgs->len, ARRAY_SIZE(trace_data));
-	bool trace_touch = msgs->addr == 0x24 && msgs->len >= 16;
 
 	dev_dbg(&i2c_imx->adapter.dev,
 		"<%s> write slave address: addr=0x%x\n",
@@ -849,10 +870,6 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs, bo
 		result = i2c_imx_trx_complete(i2c_imx);
 		if (result)
 			return result;
-		if (trace_touch && i < trace_len) {
-			trace_sr[i] = i2c_imx->i2csr;
-			trace_cr[i] = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2CR);
-		}
 		/*
 		 * First byte is the length of remaining packet
 		 * in the SMBus block data read. Add it to
@@ -903,28 +920,9 @@ static int i2c_imx_read(struct imx_i2c_struct *i2c_imx, struct i2c_msg *msgs, bo
 			msgs->buf[0] = len;
 		else
 			msgs->buf[i] = imx_i2c_read_reg(i2c_imx, IMX_I2C_I2DR);
-		if (trace_touch && i < trace_len)
-			trace_data[i] = msgs->buf[i];
 		dev_dbg(&i2c_imx->adapter.dev,
 			"<%s> read byte: B%d=0x%X\n",
 			__func__, i, msgs->buf[i]);
-	}
-	if (trace_touch) {
-		int off;
-
-		for (off = 0; off < trace_len; off += 16) {
-			int chunk = min(16, trace_len - off);
-
-			dev_info(&i2c_imx->adapter.dev,
-				"E70Q10_PIO addr=24 len=%d off=%d data=%*ph\n",
-				msgs->len, off, chunk, &trace_data[off]);
-			dev_info(&i2c_imx->adapter.dev,
-				"E70Q10_PIO addr=24 len=%d off=%d i2sr=%*ph\n",
-				msgs->len, off, chunk, &trace_sr[off]);
-			dev_info(&i2c_imx->adapter.dev,
-				"E70Q10_PIO addr=24 len=%d off=%d i2cr=%*ph\n",
-				msgs->len, off, chunk, &trace_cr[off]);
-		}
 	}
 	return 0;
 }
@@ -940,7 +938,9 @@ static int i2c_imx_xfer(struct i2c_adapter *adapter,
 	dev_dbg(&i2c_imx->adapter.dev, "<%s>\n", __func__);
 
 	if (i2c_imx->stock_transfer_clock_gating) {
-		result = clk_prepare_enable(i2c_imx->clk);
+		result = i2c_imx->shutdown_clock_prepared
+			? clk_enable(i2c_imx->clk)
+			: clk_prepare_enable(i2c_imx->clk);
 		if (result < 0)
 			goto out;
 	} else {
@@ -1019,7 +1019,10 @@ fail0:
 		 * therefore the sole clock owner and this call physically gates
 		 * it, exactly as the Netronix 3.0.35 transfer path did.
 		 */
-		clk_disable_unprepare(i2c_imx->clk);
+		if (i2c_imx->shutdown_clock_prepared)
+			clk_disable(i2c_imx->clk);
+		else
+			clk_disable_unprepare(i2c_imx->clk);
 	} else {
 		pm_runtime_mark_last_busy(i2c_imx->adapter.dev.parent);
 		pm_runtime_put_autosuspend(i2c_imx->adapter.dev.parent);
@@ -1349,8 +1352,30 @@ static const struct dev_pm_ops i2c_imx_pm_ops = {
 #define I2C_IMX_PM_OPS NULL
 #endif /* CONFIG_PM */
 
+static void i2c_imx_shutdown(struct platform_device *pdev)
+{
+	struct imx_i2c_struct *i2c_imx = platform_get_drvdata(pdev);
+	int ret;
+
+	if (!i2c_imx->stock_transfer_clock_gating)
+		return;
+
+	/* The final PMIC command runs after device_shutdown with IRQs off.
+	 * Hold only the prepare reference now; late transfers still enable
+	 * and gate the clock individually using the atomic clock API.
+	 */
+	ret = clk_prepare(i2c_imx->clk);
+	if (ret) {
+		dev_err(&pdev->dev, "shutdown clock prepare failed: %d\n", ret);
+		return;
+	}
+	i2c_imx_set_clk(i2c_imx);
+	i2c_imx->shutdown_clock_prepared = true;
+}
+
 static struct platform_driver i2c_imx_driver = {
 	.probe = i2c_imx_probe,
+	.shutdown = i2c_imx_shutdown,
 	.remove = i2c_imx_remove,
 	.driver = {
 		.name = DRIVER_NAME,

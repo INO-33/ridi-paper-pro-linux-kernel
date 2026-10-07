@@ -31,10 +31,13 @@
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/fb.h>
+#include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/delay.h>
+#include <linux/jiffies.h>
+#include <linux/rwsem.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/clk.h>
@@ -43,6 +46,9 @@
 #include <linux/firmware.h>
 #include <linux/kthread.h>
 #include <linux/dmaengine.h>
+#include <linux/workqueue.h>
+#include <linux/atomic.h>
+#include <linux/ktime.h>
 #include <linux/pxp_dma.h>
 #include <linux/pm_runtime.h>
 #include <linux/mxcfb.h>
@@ -51,11 +57,20 @@
 #include <linux/regulator/driver.h>
 #include <linux/fsl_devices.h>
 #include <linux/bitops.h>
+#include <linux/spinlock.h>
+#include <linux/wait.h>
 #include <linux/pinctrl/consumer.h>
 #include <linux/platform_data/dma-imx.h>
 #include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/io.h>
 #include <asm/cacheflush.h>
 #include <asm/unaligned.h>
+
+#ifdef CONFIG_DEBUG_FS
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+#endif
 
 #include "epdc_regs.h"
 
@@ -65,13 +80,17 @@
  */
 /*#define DEFAULT_PANEL_HW_INIT*/
 
-#define NUM_SCREENS_MIN	2
+#define NUM_SCREENS_MIN	3
 
 #define EPDC_V1_NUM_LUTS	16
 #define EPDC_V1_MAX_NUM_UPDATES 20
 #define EPDC_V2_NUM_LUTS	64
 #define EPDC_V2_MAX_NUM_UPDATES 64
 #define EPDC_MAX_NUM_BUFFERS	2
+#define E70Q10_SOURCE_SNAPSHOT_SLOTS	3
+#define E70Q10_PM_TRACE_DEPTH		96
+#define E70Q10_PM_TRACE_REGS		37
+#define E70Q10_SLEEP_BARRIER_TIMEOUT_MS	2500
 #define INVALID_LUT		(-1)
 #define DRY_RUN_NO_LUT		100
 
@@ -112,27 +131,58 @@
 #define EPDC_HIST16_P5N_PARAM2	(EPDC_HIST16_P4N_PARAM2 << 1)
 #define EPDC_HIST16_P5N_PARAM3	(EPDC_HIST16_P4N_PARAM3 << 1)
 
+#define EPDC_QOSC_CCM_CCGR4_OFFSET	0x78
+#define EPDC_QOSC_CCM_CCGR4_GATE_MASK	0x30
+#define EPDC_QOSC_MASTER_ENABLE_OFFSET	0x40
+#define EPDC_QOSC_EPDC_CHANNEL_OFFSET	0x1400
+#define EPDC_QOSC_WR_OFFSET		0xd0
+#define EPDC_QOSC_RD_OFFSET		0xe0
+#define EPDC_QOSC_STATUS_OFFSET		0xf0
+
 static unsigned long default_bpp = 16;
 static DEFINE_MUTEX(hard_lock);
 
 struct update_marker_data {
 	struct list_head full_list;
 	struct list_head upd_list;
+	struct list_head sleep_done_list;
 	u32 update_marker;
+	u32 sleep_sequence;
+	u32 update_generation;
 	struct completion update_completion;
 	int lut_num;
+	int result;
 	bool collision_test;
 	bool waiting;
+	bool retained_sleep;
 };
+
+struct e70q10_source_snapshot;
 
 struct update_desc_list {
 	struct list_head list;
 	struct mxcfb_update_data upd_data;/* Update parameters */
+	u32 fb_offset;		/* Source FB page captured when update was queued */
+	u64 fb_source_generation;
+	struct e70q10_source_snapshot *source_snapshot;
+	int fb_page_index;
+	u64 fb_page_generation;
+	bool fb_page_generation_valid;
 	u32 epdc_offs;		/* Added to buffer ptr to resolve alignment */
 	u32 epdc_stride;	/* Depends on rotation & whether we skip PxP */
 	struct list_head upd_marker_list; /* List of markers for this update */
 	u32 update_order;	/* Numeric ordering value for update */
+	u32 sleep_sequence;	/* Nonzero only for a tagged sleep-screen update */
+	bool merged;		/* At least one queued update was merged into this */
+	bool collision_resubmit;	/* This descriptor is being retried after collision */
+	u32 collided_newer_order;	/* Newer LUT order observed during collision */
+	bool collided_newer_seen;
+	bool collided_newer_completed_before_wb;
+	u32 collision_retry_count;
+	bool deferred_latest;	/* Pending source uses the reserved latest slot */
+	bool deferred_retry;	/* Was promoted from the reserved latest slot */
 };
+
 
 /* This structure represents a list node containing both
  * a memory region allocated as an output buffer for the PxP
@@ -143,9 +193,64 @@ struct update_data_list {
 	void *virt_addr;
 	struct update_desc_list *update_desc;
 	int lut_num;		/* Assigned before update is processed into working buffer */
+	bool pxp_used;
 	u64 collision_mask;	/* Set when update creates collision */
 				/* Mask of the LUTs the update collides with */
 };
+
+struct e70q10_source_snapshot {
+	void *virt_addr;
+	dma_addr_t phys_addr;
+	u32 fb_offset;
+	u64 generation;
+	u32 refs;
+};
+
+enum e70q10_pm_phase {
+	E70Q10_PM_SLEEP_LUT_ASSIGNED,
+	E70Q10_PM_SLEEP_LUT_COMPLETE,
+	E70Q10_PM_HW_IDLE_CONFIRMED,
+	E70Q10_PM_SUSPEND_HW_IDLE_CONFIRMED,
+	E70Q10_PM_POWERDOWN,
+	E70Q10_PM_SUSPEND_CB_ENTRY,
+	E70Q10_PM_FLUSH_END,
+	E70Q10_PM_EPDC_CLOCK_OFF,
+};
+
+struct e70q10_pm_trace_record {
+	u64 timestamp_ns;
+	u64 active_lut_mask;
+	u32 resume_sequence;
+	u32 sleep_sequence;
+	u32 phase;
+	u32 marker;
+	u32 lut_num;
+	u32 pending_count;
+	u32 queued_count;
+	u32 collision_count;
+	u32 marker_count;
+	u32 completed_marker_count;
+	u32 free_count;
+	u32 snapshot_busy;
+	u32 completion;
+	u32 tce_underrun_count;
+	s32 panel_powerup_result;
+	u32 regs[E70Q10_PM_TRACE_REGS];
+	u32 pxp_regs[PXP_PM_TRACE_REGS];
+	u8 submit_blocked;
+	u8 updates_active;
+	u8 cur_update;
+	u8 safe_regs;
+	u8 pxp_regs_valid;
+	u8 pxp_idle;
+	u8 powerdown_held;
+	u8 power_state;
+	u8 blank;
+	u8 display_enabled;
+	u8 vcom_enabled;
+	u8 v3p3_enabled;
+};
+
 
 struct mxc_epdc_fb_data {
 	struct fb_info info;
@@ -161,10 +266,55 @@ struct mxc_epdc_fb_data {
 	ssize_t map_size;
 	dma_addr_t phys_start;
 	u32 fb_offset;
+	u64 fb_source_generation;
 	int default_bpp;
 	int native_width;
 	int native_height;
 	int num_screens;
+	bool page_lifetime_diag;
+	bool page_lifetime_stats_created;
+	u64 *fb_page_generations;
+	u32 fb_page_generation_count;
+	spinlock_t fb_page_lock;
+	u64 source_reused_before_pxp;
+	u64 source_reused_before_copybuf;
+	u64 untracked_fb_pan;
+	u64 untracked_fb_submit;
+	bool source_snapshot_enabled;
+	struct e70q10_source_snapshot *source_snapshots;
+	u32 source_snapshot_count;
+	struct e70q10_source_snapshot deferred_latest_snapshot;
+	struct update_desc_list *deferred_latest_desc;
+	bool deferred_latest_enabled;
+	size_t source_snapshot_size;
+	size_t source_snapshot_copy_size;
+	u64 source_snapshot_copies;
+	u64 source_snapshot_hits;
+	u64 source_snapshot_busy;
+	u64 collision_created;
+	u64 collision_retry_submitted;
+	u64 collision_retry_dropped_newer;
+	u64 collision_retry_zero_mask;
+	u64 collision_newer_completed_before_wb;
+	u64 collision_retry_max_depth;
+	u64 collision_list_peak;
+	u64 snapshot_busy_final_candidate;
+	u64 deferred_latest_retry_armed;
+	u64 deferred_latest_retry_submitted;
+	u64 deferred_latest_retry_promoted;
+	u64 deferred_latest_retry_success;
+	u64 deferred_latest_retry_replaced;
+	u64 deferred_latest_retry_dropped_error;
+	u64 latest_accepted_generation;
+	u64 latest_submitted_generation;
+	u64 latest_completed_generation;
+	u64 coalesce_passes;
+	u64 coalesce_superseded_descs;
+	u64 coalesce_superseded_generations;
+	u64 coalesce_damage_expands;
+	u64 coalesce_full_bounds;
+	u64 coalesce_skipped_ineligible;
+	u64 coalesce_marker_skips;
 	int epdc_irq;
 	struct device *dev;
 	int power_state;
@@ -177,6 +327,26 @@ struct mxc_epdc_fb_data {
 	struct regulator *v3p3_regulator;
 	bool fw_default_load;
 	int rev;
+	u32 last_sleep_sequence;
+	u32 pm_resume_sequence;
+	u32 pm_trace_next;
+	u32 pm_trace_count;
+	spinlock_t pm_trace_lock;
+	struct e70q10_pm_trace_record pm_trace[E70Q10_PM_TRACE_DEPTH];
+	struct dentry *pm_trace_debugfs;
+	struct mutex pm_control_mutex;
+	bool system_suspend_in_progress;
+	bool sleep_barrier_waiting;
+	bool sleep_barrier_pending;
+	bool sleep_barrier_powerdown_held;
+	int sleep_barrier_saved_pwrdown_delay;
+	u32 sleep_lut_sequence[64];
+	bool display_enabled;
+	bool vcom_enabled;
+	bool v3p3_enabled;
+	bool epdc_clocks_enabled;
+	bool runtime_pm_held;
+	s32 last_panel_powerup_result;
 
 	/* FB elements related to EPDC updates */
 	int num_luts;
@@ -193,6 +363,9 @@ struct mxc_epdc_fb_data {
 	struct list_head upd_buf_collision_list;
 	struct update_data_list *cur_update;
 	struct mutex queue_mutex;
+	bool cleanup_fence_active;
+	int cleanup_fence_lut;
+	u32 cleanup_fence_marker;
 	int trt_entries;
 	int temp_index;
 	u8 *temp_range_bounds;
@@ -222,6 +395,9 @@ struct mxc_epdc_fb_data {
 	void *virt_addr_copybuf;	/* Used for PxP SW workaround */
 	u32 order_cnt;
 	struct list_head full_marker_list;
+	struct list_head sleep_marker_done_list;
+	wait_queue_head_t sleep_barrier_waitq;
+	atomic_t sleep_barrier_event;
 	u32 *lut_update_order;		/* Array size = number of luts */
 	u64 epdc_colliding_luts;
 	u64 luts_complete_wb;
@@ -231,6 +407,14 @@ struct mxc_epdc_fb_data {
 	struct work_struct epdc_submit_work;
 	struct workqueue_struct *epdc_intr_workqueue;
 	struct work_struct epdc_intr_work;
+	struct work_struct epdc_recovery_work;
+	struct completion epdc_recovery_done;
+	spinlock_t epdc_recovery_lock;
+	atomic_t epdc_recovery_state;	/* 0=idle, 1=running, 2=failed */
+	atomic_t tce_underrun_count;
+	int epdc_recovery_result;
+	bool suspend_blocked;
+	bool recovery_refresh_active;
 	bool waiting_for_wb;
 	bool waiting_for_lut;
 	bool waiting_for_lut15;
@@ -240,6 +424,8 @@ struct mxc_epdc_fb_data {
 	int eof_sync_period;
 	struct mutex power_mutex;
 	bool powering_down;
+	/* Keep the first post-init idle powerdown on the legacy boot path. */
+	bool boot_initial_powerdown_pending;
 	bool updates_active;
 	int pwrdown_delay;
 	unsigned long tce_prevent;
@@ -249,12 +435,443 @@ struct mxc_epdc_fb_data {
 	/* FB elements related to PxP DMA */
 	struct completion pxp_tx_cmpl;
 	struct pxp_channel *pxp_chan;
+	struct dma_chan *pxp_debug_chan;
 	struct pxp_config_data pxp_conf;
-	struct dma_async_tx_descriptor *txd;
+	u32 pxp_hist_status;
 	dma_cookie_t cookie;
 	struct scatterlist sg[2];
 	struct mutex pxp_mutex; /* protects access to PxP */
 };
+
+static const char * const e70q10_pm_phase_names[] = {
+	"SLEEP_LUT_ASSIGNED", "SLEEP_LUT_COMPLETE",
+	"HW_IDLE_CONFIRMED", "SUSPEND_HW_IDLE_CONFIRMED",
+	"POWERDOWN", "SUSPEND_CB_ENTRY", "FLUSH_END", "EPDC_CLOCK_OFF",
+};
+
+static const char * const e70q10_pm_reg_names[E70Q10_PM_TRACE_REGS] = {
+	"CTRL", "RES", "FORMAT", "FIFOCTRL", "WVADDR", "WB_ADDR",
+	"WB_ADDR_TCE", "TCE_CTRL", "TCE_SDCFG", "TCE_GDCFG",
+	"TCE_HSCAN1", "TCE_HSCAN2", "TCE_VSCAN", "TCE_OE",
+	"TCE_POLARITY", "TCE_TIMING1", "TCE_TIMING2", "TCE_TIMING3",
+	"IRQ_MASK", "IRQ", "IRQ_MASK1", "IRQ1", "IRQ_MASK2", "IRQ2",
+	"STATUS", "STATUS_LUTS", "STATUS_LUTS2", "STATUS_NEXTLUT",
+	"STATUS_COL", "TEMP", "AUTOWV_LUT", "UPD_ADDR", "UPD_STRIDE",
+	"UPD_CORD", "UPD_SIZE", "UPD_CTRL", "STATUS_COL2",
+};
+
+static bool chan_filter(struct dma_chan *chan, void *arg);
+
+static struct dma_chan *epdc_request_pxp_pm_channel(void)
+{
+	dma_cap_mask_t mask;
+
+	dma_cap_zero(mask);
+	dma_cap_set(DMA_SLAVE, mask);
+	dma_cap_set(DMA_PRIVATE, mask);
+	return dma_request_channel(mask, chan_filter, NULL);
+}
+
+static void epdc_pm_trace_capture_locked(
+	struct mxc_epdc_fb_data *fb_data, enum e70q10_pm_phase phase,
+	bool safe_regs, bool clock_access_held, int completion,
+	const u32 *pxp_regs)
+{
+	struct e70q10_pm_trace_record record;
+	struct update_data_list *buf;
+	struct update_desc_list *pending;
+	struct update_marker_data *marker;
+	unsigned long flags;
+
+	if (!of_machine_is_compatible("ridi,e70q10"))
+		return;
+	memset(&record, 0, sizeof(record));
+	record.timestamp_ns = ktime_get_ns();
+	record.completion = completion;
+	record.resume_sequence = fb_data->pm_resume_sequence;
+	record.phase = phase;
+	record.sleep_sequence = fb_data->last_sleep_sequence;
+	record.powerdown_held = fb_data->sleep_barrier_powerdown_held;
+	record.tce_underrun_count = atomic_read(&fb_data->tce_underrun_count);
+	record.panel_powerup_result = fb_data->last_panel_powerup_result;
+	record.submit_blocked = fb_data->suspend_blocked ||
+		fb_data->sleep_barrier_waiting;
+	record.updates_active = fb_data->updates_active;
+	record.cur_update = fb_data->cur_update != NULL;
+	record.power_state = fb_data->power_state;
+	record.blank = fb_data->blank;
+	record.display_enabled = fb_data->display_enabled;
+	record.vcom_enabled = fb_data->vcom_enabled;
+	record.v3p3_enabled = fb_data->v3p3_enabled;
+	record.safe_regs = safe_regs;
+	if (fb_data->source_snapshots) {
+		u32 slot;
+
+		for (slot = 0; slot < fb_data->source_snapshot_count; slot++)
+			if (fb_data->source_snapshots[slot].refs)
+				record.snapshot_busy++;
+	}
+
+	list_for_each_entry(pending, &fb_data->upd_pending_list, list)
+		record.pending_count++;
+	list_for_each_entry(buf, &fb_data->upd_buf_queue, list)
+		record.queued_count++;
+	list_for_each_entry(buf, &fb_data->upd_buf_collision_list, list)
+		record.collision_count++;
+	list_for_each_entry(marker, &fb_data->full_marker_list, full_list)
+		record.marker_count++;
+	list_for_each_entry(marker, &fb_data->sleep_marker_done_list,
+			    sleep_done_list)
+		record.completed_marker_count++;
+	list_for_each_entry(buf, &fb_data->upd_buf_free_list, list)
+		record.free_count++;
+
+	if (safe_regs) {
+		bool regs_accessible;
+
+		/* queue_mutex -> power_mutex matches the submit worker's lock order.
+		 * clock_access_held is used only by callers already holding a clock
+		 * lease (or power_mutex), so no second power_mutex acquisition is needed.
+		 */
+		if (!clock_access_held)
+			mutex_lock(&fb_data->power_mutex);
+		regs_accessible = clock_access_held ||
+			(fb_data->power_state == POWER_STATE_ON &&
+			 fb_data->epdc_clocks_enabled);
+		if (regs_accessible) {
+		record.regs[0] = __raw_readl(EPDC_CTRL);
+		record.regs[1] = __raw_readl(EPDC_RES);
+		record.regs[2] = __raw_readl(EPDC_FORMAT);
+		record.regs[3] = __raw_readl(EPDC_FIFOCTRL);
+		record.regs[4] = __raw_readl(EPDC_WVADDR);
+		record.regs[5] = __raw_readl(EPDC_WB_ADDR);
+		record.regs[6] = __raw_readl(EPDC_WB_ADDR_TCE);
+		record.regs[7] = __raw_readl(EPDC_TCE_CTRL);
+		record.regs[8] = __raw_readl(EPDC_TCE_SDCFG);
+		record.regs[9] = __raw_readl(EPDC_TCE_GDCFG);
+		record.regs[10] = __raw_readl(EPDC_TCE_HSCAN1);
+		record.regs[11] = __raw_readl(EPDC_TCE_HSCAN2);
+		record.regs[12] = __raw_readl(EPDC_TCE_VSCAN);
+		record.regs[13] = __raw_readl(EPDC_TCE_OE);
+		record.regs[14] = __raw_readl(EPDC_TCE_POLARITY);
+		record.regs[15] = __raw_readl(EPDC_TCE_TIMING1);
+		record.regs[16] = __raw_readl(EPDC_TCE_TIMING2);
+		record.regs[17] = __raw_readl(EPDC_TCE_TIMING3);
+		record.regs[18] = __raw_readl(EPDC_IRQ_MASK);
+		record.regs[19] = __raw_readl(EPDC_IRQ);
+		record.regs[20] = __raw_readl(EPDC_IRQ_MASK1);
+		record.regs[21] = __raw_readl(EPDC_IRQ1);
+		record.regs[22] = __raw_readl(EPDC_IRQ_MASK2);
+		record.regs[23] = __raw_readl(EPDC_IRQ2);
+		record.regs[24] = __raw_readl(EPDC_STATUS);
+		record.regs[25] = __raw_readl(EPDC_STATUS_LUTS);
+		record.regs[26] = __raw_readl(EPDC_STATUS_LUTS2);
+		record.regs[27] = __raw_readl(EPDC_STATUS_NEXTLUT);
+		record.regs[28] = __raw_readl(EPDC_STATUS_COL);
+		record.regs[29] = __raw_readl(EPDC_TEMP);
+		record.regs[30] = __raw_readl(EPDC_AUTOWV_LUT);
+		record.regs[31] = __raw_readl(EPDC_UPD_ADDR);
+		record.regs[32] = __raw_readl(EPDC_UPD_STRIDE);
+		record.regs[33] = __raw_readl(EPDC_UPD_CORD);
+		record.regs[34] = __raw_readl(EPDC_UPD_SIZE);
+		record.regs[35] = __raw_readl(EPDC_UPD_CTRL);
+		record.regs[36] = __raw_readl(EPDC_STATUS_COL2);
+		record.active_lut_mask = record.regs[25] |
+			((u64)record.regs[26] << 32);
+		} else {
+			record.safe_regs = 0;
+		}
+		if (!clock_access_held)
+			mutex_unlock(&fb_data->power_mutex);
+	}
+
+	if (pxp_regs) {
+		memcpy(record.pxp_regs, pxp_regs, sizeof(record.pxp_regs));
+		record.pxp_regs_valid = 1;
+		record.pxp_idle = 1;
+	}
+
+	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
+	fb_data->pm_trace[fb_data->pm_trace_next] = record;
+	fb_data->pm_trace_next = (fb_data->pm_trace_next + 1) %
+		E70Q10_PM_TRACE_DEPTH;
+	if (fb_data->pm_trace_count < E70Q10_PM_TRACE_DEPTH)
+		fb_data->pm_trace_count++;
+	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
+}
+
+/* Caller holds queue_mutex; record only the assigned sleep-update LUT. */
+static void epdc_pm_trace_sleep_lut_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		enum e70q10_pm_phase phase, u32 sequence, u32 lut_num,
+		int completion)
+{
+	unsigned long flags;
+	struct e70q10_pm_trace_record *record;
+	u32 slot;
+
+	epdc_pm_trace_capture_locked(fb_data, phase, true, false,
+				     completion, NULL);
+	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
+	if (fb_data->pm_trace_count) {
+		slot = (fb_data->pm_trace_next + E70Q10_PM_TRACE_DEPTH - 1) %
+			E70Q10_PM_TRACE_DEPTH;
+		record = &fb_data->pm_trace[slot];
+		record->sleep_sequence = sequence;
+		record->lut_num = lut_num;
+	}
+	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
+}
+
+static void epdc_sleep_marker_discard_old_locked(
+		struct mxc_epdc_fb_data *fb_data, u32 sequence)
+{
+	struct update_marker_data *marker, *tmp;
+
+	list_for_each_entry_safe(marker, tmp,
+		&fb_data->sleep_marker_done_list, sleep_done_list) {
+		if (marker->sleep_sequence == sequence)
+			continue;
+		list_del_init(&marker->sleep_done_list);
+		kfree(marker);
+	}
+}
+
+static void epdc_pm_trace_capture(struct mxc_epdc_fb_data *fb_data,
+				  enum e70q10_pm_phase phase,
+				  bool safe_regs,
+				  bool clock_access_held,
+				  const u32 *pxp_regs)
+{
+	mutex_lock(&fb_data->queue_mutex);
+	epdc_pm_trace_capture_locked(fb_data, phase, safe_regs,
+				     clock_access_held, 0, pxp_regs);
+	mutex_unlock(&fb_data->queue_mutex);
+}
+
+static void epdc_sleep_barrier_wake(struct mxc_epdc_fb_data *fb_data)
+{
+	atomic_inc(&fb_data->sleep_barrier_event);
+	wake_up_all(&fb_data->sleep_barrier_waitq);
+}
+
+
+
+static bool epdc_is_full_panel_gc16_cleanup(
+				struct mxc_epdc_fb_data *fb_data,
+				const struct mxcfb_update_data *upd);
+
+/* Return a discrete y-pan page index, or -EINVAL for a non-page pan. */
+static int epdc_fb_page_index(struct mxc_epdc_fb_data *fb_data, u32 fb_offset)
+{
+	u32 page_bytes = fb_data->info.fix.line_length * fb_data->info.var.yres;
+	u32 page;
+
+	if (!fb_data->page_lifetime_diag || !fb_data->fb_page_generations ||
+	    !page_bytes || fb_offset % page_bytes)
+		return -EINVAL;
+
+	page = fb_offset / page_bytes;
+	if (page >= fb_data->fb_page_generation_count ||
+	    (u64)fb_offset + page_bytes > (u64)fb_data->map_size)
+		return -EINVAL;
+
+	return page;
+}
+
+static bool epdc_fb_page_generation_changed(struct mxc_epdc_fb_data *fb_data,
+					   struct update_desc_list *desc)
+{
+	unsigned long flags;
+	bool changed = false;
+
+	if (!fb_data->page_lifetime_diag ||
+	    !desc->fb_page_generation_valid ||
+	    (desc->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER))
+		return false;
+
+	spin_lock_irqsave(&fb_data->fb_page_lock, flags);
+	if (desc->fb_page_index >= 0 &&
+	    desc->fb_page_index < fb_data->fb_page_generation_count)
+		changed = fb_data->fb_page_generations[desc->fb_page_index] !=
+			desc->fb_page_generation;
+	spin_unlock_irqrestore(&fb_data->fb_page_lock, flags);
+	return changed;
+}
+
+static void epdc_record_fb_page_reuse(struct mxc_epdc_fb_data *fb_data,
+				      bool before_copybuf)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&fb_data->fb_page_lock, flags);
+	if (before_copybuf)
+		fb_data->source_reused_before_copybuf++;
+	else
+		fb_data->source_reused_before_pxp++;
+	spin_unlock_irqrestore(&fb_data->fb_page_lock, flags);
+}
+
+/*
+ * E70Q10 queues EPDC work after MXCFB_SEND_UPDATE returns, while Android may
+ * recycle the posted framebuffer page immediately because HWC1 has no release
+ * fence.  Keep an immutable RGB565 source until the update descriptor becomes
+ * terminal.  All helpers below are called with queue_mutex held.
+ */
+static void e70q10_source_snapshot_put_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct e70q10_source_snapshot *snapshot)
+{
+	if (!snapshot)
+		return;
+	if (WARN_ON(snapshot->refs == 0))
+		return;
+	snapshot->refs--;
+	if (snapshot == &fb_data->deferred_latest_snapshot &&
+	    snapshot->refs == 0)
+		fb_data->deferred_latest_desc = NULL;
+}
+
+static void epdc_free_update_desc_locked(struct mxc_epdc_fb_data *fb_data,
+					struct update_desc_list *desc)
+{
+	if (!desc)
+		return;
+	if (fb_data->deferred_latest_desc == desc) {
+		fb_data->deferred_latest_desc = NULL;
+		if (desc->deferred_latest)
+			fb_data->deferred_latest_retry_replaced++;
+	}
+	e70q10_source_snapshot_put_locked(fb_data, desc->source_snapshot);
+	desc->source_snapshot = NULL;
+	kfree(desc);
+}
+
+static void e70q10_copy_frame_to_snapshot_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct e70q10_source_snapshot *snapshot, u32 fb_offset,
+		u64 generation)
+{
+	memcpy(snapshot->virt_addr,
+	       (u8 *)fb_data->info.screen_base + fb_offset,
+	       fb_data->source_snapshot_copy_size);
+	if (fb_data->source_snapshot_size > fb_data->source_snapshot_copy_size)
+		memset((u8 *)snapshot->virt_addr +
+		       fb_data->source_snapshot_copy_size, 0xff,
+		       fb_data->source_snapshot_size -
+		       fb_data->source_snapshot_copy_size);
+	/* Publish CPU stores before PxP is allowed to DMA-read this slot. */
+	wmb();
+	snapshot->fb_offset = fb_offset;
+	snapshot->generation = generation;
+}
+
+static bool e70q10_promote_deferred_snapshot_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *desc)
+{
+	struct e70q10_source_snapshot *slot = NULL;
+	u32 i;
+
+	if (!desc || desc->source_snapshot !=
+			&fb_data->deferred_latest_snapshot)
+		return true;
+
+	for (i = 0; i < fb_data->source_snapshot_count; i++) {
+		if (!fb_data->source_snapshots[i].refs) {
+			slot = &fb_data->source_snapshots[i];
+			break;
+		}
+	}
+	if (!slot)
+		return false;
+
+	memcpy(slot->virt_addr,
+	       fb_data->deferred_latest_snapshot.virt_addr,
+	       fb_data->source_snapshot_copy_size);
+	if (fb_data->source_snapshot_size > fb_data->source_snapshot_copy_size)
+		memset((u8 *)slot->virt_addr + fb_data->source_snapshot_copy_size,
+		       0xff, fb_data->source_snapshot_size -
+		       fb_data->source_snapshot_copy_size);
+	wmb();
+	slot->fb_offset = fb_data->deferred_latest_snapshot.fb_offset;
+	slot->generation = fb_data->deferred_latest_snapshot.generation;
+	slot->refs = 1;
+	fb_data->deferred_latest_snapshot.refs = 0;
+	fb_data->deferred_latest_desc = NULL;
+	desc->source_snapshot = slot;
+	desc->deferred_latest = false;
+	desc->deferred_retry = true;
+	fb_data->deferred_latest_retry_promoted++;
+	fb_data->source_snapshot_copies++;
+	return true;
+}
+
+static int e70q10_source_snapshot_acquire_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *desc)
+{
+	struct e70q10_source_snapshot *slot = NULL;
+	u32 i;
+
+	if (!fb_data->source_snapshot_enabled ||
+	    (desc->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER) ||
+	    fb_data->upd_scheme == UPDATE_SCHEME_SNAPSHOT)
+		return 0;
+
+	if (!fb_data->source_snapshots || !fb_data->source_snapshot_count ||
+	    !fb_data->source_snapshot_copy_size ||
+	    (u64)desc->fb_offset + fb_data->source_snapshot_copy_size >
+			(u64)fb_data->map_size)
+		return -EINVAL;
+
+	/*
+	 * Multiple dirty rectangles generated by one fb_post share the same
+	 * immutable full-frame copy while at least one descriptor still owns it.
+	 * A zero-ref slot is never treated as a cache hit: generic mmap users may
+	 * change framebuffer bytes without issuing FBIOPAN_DISPLAY.
+	 */
+	for (i = 0; i < fb_data->source_snapshot_count; i++) {
+		struct e70q10_source_snapshot *candidate =
+			&fb_data->source_snapshots[i];
+
+		if (candidate->refs &&
+		    candidate->fb_offset == desc->fb_offset &&
+		    candidate->generation == desc->fb_source_generation) {
+			candidate->refs++;
+			desc->source_snapshot = candidate;
+			fb_data->source_snapshot_hits++;
+			return 0;
+		}
+		if (!candidate->refs && !slot)
+			slot = candidate;
+	}
+
+	if (!slot) {
+		return -EBUSY;
+	}
+
+	e70q10_copy_frame_to_snapshot_locked(fb_data, slot,
+		desc->fb_offset, desc->fb_source_generation);
+	slot->refs = 1;
+	desc->source_snapshot = slot;
+	fb_data->source_snapshot_copies++;
+	return 0;
+}
+
+static void e70q10_source_snapshot_adopt_newer_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *dst,
+		struct update_desc_list *src)
+{
+	if (dst->source_snapshot == src->source_snapshot)
+		return;
+
+	e70q10_source_snapshot_put_locked(fb_data, dst->source_snapshot);
+	dst->source_snapshot = src->source_snapshot;
+	/* Move src's reference; its descriptor will be freed after the merge. */
+	src->source_snapshot = NULL;
+}
 
 struct waveform_data_header {
 	unsigned int wi0;
@@ -418,7 +1035,7 @@ static struct fb_videomode ed078kh1_mode = {
 	.pixclock = 133400000,
 	.left_margin = 44,
 	.right_margin = 89,
-	.upper_margin = 8,
+	.upper_margin = 4,
 	.lower_margin = 5,
 	.hsync_len = 44,
 	.vsync_len = 1,
@@ -575,12 +1192,25 @@ struct mxc_epdc_fb_data *g_fb_data;
 /* forward declaration */
 static int mxc_epdc_fb_get_temp_index(struct mxc_epdc_fb_data *fb_data,
 						int temp);
-static void mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data);
+static int mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data);
+static int epdc_wait_for_hw_idle(struct mxc_epdc_fb_data *fb_data,
+				 bool allow_powering_down,
+				 unsigned int timeout_ms,
+				 u32 *pxp_regs);
+static int epdc_hw_idle_locked(struct mxc_epdc_fb_data *fb_data,
+			       bool allow_powering_down);
 static int mxc_epdc_fb_blank(int blank, struct fb_info *info);
+static int __mxc_epdc_fb_send_single_update(
+	struct mxcfb_update_data *upd_data, struct fb_info *info,
+	bool serialize, void *serialize_wait_state, u32 sleep_sequence);
+static void epdc_recovery_work_func(struct work_struct *work);
 static int mxc_epdc_fb_init_hw(struct fb_info *info);
+static void epdc_sleep_barrier_restore_powerdown_locked(
+	struct mxc_epdc_fb_data *fb_data, bool schedule_if_idle);
 static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 			      u32 src_width, u32 src_height,
-			      struct mxcfb_rect *update_region);
+			      struct mxcfb_rect *update_region,
+			      struct update_desc_list *source_desc);
 static int pxp_complete_update(struct mxc_epdc_fb_data *fb_data, u32 *hist_stat);
 
 static void draw_mode0(struct mxc_epdc_fb_data *fb_data);
@@ -945,10 +1575,12 @@ static void epdc_set_update_stride(u32 stride)
 	__raw_writel(stride, EPDC_UPD_STRIDE);
 }
 
-static void epdc_submit_update(u32 lut_num, u32 waveform_mode, u32 update_mode,
+static void epdc_submit_update(struct mxc_epdc_fb_data *fb_data,
+				u32 lut_num, u32 waveform_mode, u32 update_mode,
 			       bool use_dry_run, bool use_test_mode, u32 np_val)
 {
 	u32 reg_val = 0;
+
 
 	if (use_test_mode) {
 		reg_val |=
@@ -1172,7 +1804,7 @@ static void epdc_set_horizontal_timing(u32 horiz_start, u32 horiz_end,
 }
 
 static void epdc_set_vertical_timing(u32 vert_start, u32 vert_end,
-				     u32 vsync_width)
+				    u32 vsync_width)
 {
 	u32 reg_val =
 	    ((vert_start << EPDC_TCE_VSCAN_FRAME_BEGIN_OFFSET) &
@@ -1184,31 +1816,12 @@ static void epdc_set_vertical_timing(u32 vert_start, u32 vert_end,
 	__raw_writel(reg_val, EPDC_TCE_VSCAN);
 }
 
-static void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
+static void epdc_program_settings(struct mxc_epdc_fb_data *fb_data)
 {
 	struct imx_epdc_fb_mode *epdc_mode = fb_data->cur_mode;
 	u32 reg_val;
 	int num_ce;
 	int i;
-
-	/* Enable clocks to access EPDC regs */
-	clk_prepare_enable(fb_data->epdc_clk_axi);
-	clk_prepare_enable(fb_data->epdc_clk_pix);
-
-	/* Reset */
-	__raw_writel(EPDC_CTRL_SFTRST, EPDC_CTRL_SET);
-	while (!(__raw_readl(EPDC_CTRL) & EPDC_CTRL_CLKGATE))
-		;
-	udelay(200);
-
-	/* Netronix restart ordering avoids a stale TCE-underrun crossing from
-	 * the system clock domain into the pixel clock domain.
-	 */
-	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_CLEAR);
-	udelay(100);
-	__raw_writel(EPDC_CTRL_SFTRST, EPDC_CTRL_CLEAR);
-	while (__raw_readl(EPDC_CTRL) & (EPDC_CTRL_SFTRST | EPDC_CTRL_CLKGATE))
-		;
 
 	/* EPDC_CTRL */
 	reg_val = __raw_readl(EPDC_CTRL);
@@ -1250,7 +1863,8 @@ static void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
 
 	/*
 	 * EPDC_TCE_CTRL
-	 * VSCAN_HOLDOFF = 4
+	 * VSCAN_HOLDOFF defaults to the selected panel mode's value (4 for
+	 * E70Q10).
 	 * VCOM_MODE = MANUAL
 	 * VCOM_VAL = 0
 	 * DDR_MODE = DISABLED
@@ -1266,9 +1880,6 @@ static void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
 	    | EPDC_TCE_CTRL_PIXELS_PER_SDCLK_8
 	    | EPDC_TCE_CTRL_SDDO_WIDTH_16BIT;
 	__raw_writel(reg_val, EPDC_TCE_CTRL);
-	dev_info(fb_data->dev,
-		 "Netronix TCE: 16-bit SDDO, 8 pixels/SDCLK, ctrl=0x%08x\n",
-		 reg_val);
 
 	/* EPDC_TCE_HSCAN */
 	epdc_set_horizontal_timing(epdc_mode->vmode->left_margin,
@@ -1278,8 +1889,8 @@ static void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
 
 	/* EPDC_TCE_VSCAN */
 	epdc_set_vertical_timing(epdc_mode->vmode->upper_margin,
-				 epdc_mode->vmode->lower_margin,
-				 epdc_mode->vmode->vsync_len);
+			 epdc_mode->vmode->lower_margin,
+			 epdc_mode->vmode->vsync_len);
 
 	/* EPDC_TCE_OE */
 	reg_val =
@@ -1392,101 +2003,254 @@ static void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
 		__raw_writel(EPDC_HIST16_P4N_PARAM2, EPDC_HIST16_PARAM2);
 		__raw_writel(EPDC_HIST16_P4N_PARAM3, EPDC_HIST16_PARAM3);
 	}
+}
 
-	/* Disable clock */
+static int epdc_init_settings_runtime(struct mxc_epdc_fb_data *fb_data)
+{
+	unsigned long timeout;
+	int ret;
+
+	/* Runtime reset callers use checked clocks and bounded reset polling. */
+	ret = clk_prepare_enable(fb_data->epdc_clk_axi);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(fb_data->epdc_clk_pix);
+	if (ret) {
+		clk_disable_unprepare(fb_data->epdc_clk_axi);
+		return ret;
+	}
+
+	/* Reset */
+	__raw_writel(EPDC_CTRL_SFTRST, EPDC_CTRL_SET);
+	timeout = jiffies + msecs_to_jiffies(100);
+	while (!(__raw_readl(EPDC_CTRL) & EPDC_CTRL_CLKGATE)) {
+		if (time_after_eq(jiffies, timeout)) {
+			dev_err(fb_data->dev,
+				"EPDC reset did not assert CLKGATE\n");
+			ret = -ETIMEDOUT;
+			goto out_disable_clocks;
+		}
+		udelay(1);
+	}
+	udelay(200);
+
+	/* Netronix restart ordering avoids a stale TCE-underrun crossing from
+	 * the system clock domain into the pixel clock domain.
+	 */
+	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_CLEAR);
+	udelay(100);
+	__raw_writel(EPDC_CTRL_SFTRST, EPDC_CTRL_CLEAR);
+	timeout = jiffies + msecs_to_jiffies(100);
+	while (__raw_readl(EPDC_CTRL) &
+	       (EPDC_CTRL_SFTRST | EPDC_CTRL_CLKGATE)) {
+		if (time_after_eq(jiffies, timeout)) {
+			dev_err(fb_data->dev,
+				"EPDC reset did not clear SFTRST/CLKGATE\n");
+			ret = -ETIMEDOUT;
+			goto out_disable_clocks;
+		}
+		udelay(1);
+	}
+
+	epdc_program_settings(fb_data);
+	ret = 0;
+
+out_disable_clocks:
 	clk_disable_unprepare(fb_data->epdc_clk_axi);
 	clk_disable_unprepare(fb_data->epdc_clk_pix);
+	return ret;
+}
+
+static void epdc_init_settings(struct mxc_epdc_fb_data *fb_data)
+{
+	/* Match the original boot-time EPDC reset polling and clock handling. */
+	clk_prepare_enable(fb_data->epdc_clk_axi);
+	clk_prepare_enable(fb_data->epdc_clk_pix);
+
+	__raw_writel(EPDC_CTRL_SFTRST, EPDC_CTRL_SET);
+	while (!(__raw_readl(EPDC_CTRL) & EPDC_CTRL_CLKGATE))
+		;
+	udelay(200);
+
+	/* Netronix restart ordering avoids stale TCE-underrun crossing. */
+	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_CLEAR);
+	udelay(100);
+	__raw_writel(EPDC_CTRL_SFTRST, EPDC_CTRL_CLEAR);
+	while (__raw_readl(EPDC_CTRL) &
+	       (EPDC_CTRL_SFTRST | EPDC_CTRL_CLKGATE))
+		;
+
+	epdc_program_settings(fb_data);
+	clk_disable_unprepare(fb_data->epdc_clk_axi);
+	clk_disable_unprepare(fb_data->epdc_clk_pix);
+}
+
+/* power_mutex must be held by all three helpers below. */
+static int epdc_powerup_clocks_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	int ret;
+
+	if (!fb_data->v3p3_enabled) {
+		ret = regulator_enable(fb_data->v3p3_regulator);
+		if (ret)
+			return ret;
+		fb_data->v3p3_enabled = true;
+		msleep(1);
+	}
+
+	if (!fb_data->runtime_pm_held) {
+		ret = pm_runtime_get_sync(fb_data->dev);
+		if (ret < 0) {
+			pm_runtime_put_noidle(fb_data->dev);
+			goto err_v3p3;
+		}
+		fb_data->runtime_pm_held = true;
+	}
+
+	if (!fb_data->epdc_clocks_enabled) {
+		ret = clk_prepare_enable(fb_data->epdc_clk_axi);
+		if (ret)
+			goto err_runtime;
+		ret = clk_prepare_enable(fb_data->epdc_clk_pix);
+		if (ret) {
+			clk_disable_unprepare(fb_data->epdc_clk_axi);
+			goto err_runtime;
+		}
+		fb_data->epdc_clocks_enabled = true;
+	}
+
+	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_CLEAR);
+	return 0;
+
+err_runtime:
+	if (fb_data->runtime_pm_held) {
+		pm_runtime_put_sync_suspend(fb_data->dev);
+		fb_data->runtime_pm_held = false;
+	}
+err_v3p3:
+	if (fb_data->v3p3_enabled) {
+		regulator_disable(fb_data->v3p3_regulator);
+		fb_data->v3p3_enabled = false;
+	}
+	return ret;
+}
+
+static int epdc_panel_powerup_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	bool enabled_display = false;
+	int ret = 0;
+
+	if (!fb_data->display_enabled) {
+		ret = regulator_enable(fb_data->display_regulator);
+		if (ret)
+			goto out;
+		fb_data->display_enabled = true;
+		enabled_display = true;
+	}
+	if (!fb_data->vcom_enabled) {
+		ret = regulator_enable(fb_data->vcom_regulator);
+		if (ret && enabled_display) {
+			regulator_disable(fb_data->display_regulator);
+			fb_data->display_enabled = false;
+		}
+		if (ret)
+			goto out;
+		fb_data->vcom_enabled = true;
+	}
+out:
+	/* DISPLAY regulator enable includes the TPS65185 PWRGOOD wait result. */
+	fb_data->last_panel_powerup_result = ret;
+	return ret;
+}
+
+static int epdc_panel_powerdown_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	int ret = 0;
+	int rail_ret;
+
+	if (fb_data->vcom_enabled) {
+		rail_ret = regulator_disable(fb_data->vcom_regulator);
+		if (!rail_ret)
+			fb_data->vcom_enabled = false;
+		else
+			ret = rail_ret;
+	}
+	if (fb_data->display_enabled) {
+		rail_ret = regulator_disable(fb_data->display_regulator);
+		if (!rail_ret)
+			fb_data->display_enabled = false;
+		else if (!ret)
+			ret = rail_ret;
+	}
+	return ret;
+}
+
+static void epdc_powerdown_clocks_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	if (fb_data->epdc_clocks_enabled) {
+		__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_SET);
+		clk_disable_unprepare(fb_data->epdc_clk_pix);
+		clk_disable_unprepare(fb_data->epdc_clk_axi);
+		fb_data->epdc_clocks_enabled = false;
+	}
+	if (fb_data->runtime_pm_held) {
+		pm_runtime_put_sync_suspend(fb_data->dev);
+		fb_data->runtime_pm_held = false;
+	}
+	if (fb_data->v3p3_enabled) {
+		regulator_disable(fb_data->v3p3_regulator);
+		fb_data->v3p3_enabled = false;
+	}
 }
 
 static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 {
-	int ret = 0;
-	mutex_lock(&fb_data->power_mutex);
+	int ret;
 
-	/*
-	 * If power down request is pending, clear
-	 * powering_down to cancel the request.
-	 */
+	mutex_lock(&fb_data->power_mutex);
 	if (fb_data->powering_down)
 		fb_data->powering_down = false;
-
-	if (fb_data->power_state == POWER_STATE_ON) {
-		mutex_unlock(&fb_data->power_mutex);
-		return;
-	}
+	fb_data->updates_active = true;
+	if (fb_data->power_state == POWER_STATE_ON)
+		goto out;
 
 	dev_dbg(fb_data->dev, "EPDC Powerup\n");
-
-	fb_data->updates_active = true;
-
-	/* Enable the v3p3 regulator */
-	ret = regulator_enable(fb_data->v3p3_regulator);
-	if (IS_ERR((void *)ret)) {
-		dev_err(fb_data->dev, "Unable to enable V3P3 regulator."
-			"err = 0x%x\n", ret);
-		mutex_unlock(&fb_data->power_mutex);
-		return;
+	ret = epdc_powerup_clocks_locked(fb_data);
+	if (ret)
+		goto fail;
+	ret = epdc_panel_powerup_locked(fb_data);
+	if (ret) {
+		epdc_powerdown_clocks_locked(fb_data);
+		goto fail;
 	}
-
-	msleep(1);
-
-	pm_runtime_get_sync(fb_data->dev);
-
-	/* Enable clocks to EPDC */
-	clk_prepare_enable(fb_data->epdc_clk_axi);
-	clk_prepare_enable(fb_data->epdc_clk_pix);
-
-	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_CLEAR);
-
-	/* Enable power to the EPD panel */
-	ret = regulator_enable(fb_data->display_regulator);
-	if (IS_ERR((void *)ret)) {
-		dev_err(fb_data->dev, "Unable to enable DISPLAY regulator."
-			"err = 0x%x\n", ret);
-		mutex_unlock(&fb_data->power_mutex);
-		return;
-	}
-	ret = regulator_enable(fb_data->vcom_regulator);
-	if (IS_ERR((void *)ret)) {
-		dev_err(fb_data->dev, "Unable to enable VCOM regulator."
-			"err = 0x%x\n", ret);
-		mutex_unlock(&fb_data->power_mutex);
-		return;
-	}
-
 	fb_data->power_state = POWER_STATE_ON;
+	goto out;
 
+fail:
+	fb_data->updates_active = false;
+	dev_err(fb_data->dev, "EPDC power-up failed: %d\n", ret);
+out:
 	mutex_unlock(&fb_data->power_mutex);
 }
 
-static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
+static void epdc_powerdown_locked(struct mxc_epdc_fb_data *fb_data,
+				 bool trace)
 {
-	mutex_lock(&fb_data->power_mutex);
-
-	/* If powering_down has been cleared, a powerup
-	 * request is pre-empting this powerdown request.
+	/* Caller holds power_mutex.  Runtime callers also hold queue_mutex.  The
+	 * legacy boot caller deliberately skips queue/HW-idle bookkeeping.
 	 */
-	if (!fb_data->powering_down
-		|| (fb_data->power_state == POWER_STATE_OFF)) {
-		mutex_unlock(&fb_data->power_mutex);
+	if (!fb_data->powering_down ||
+	    fb_data->power_state == POWER_STATE_OFF)
 		return;
-	}
 
 	dev_dbg(fb_data->dev, "EPDC Powerdown\n");
+	if (trace)
+		epdc_pm_trace_capture_locked(fb_data,
+			E70Q10_PM_POWERDOWN, true, true, 0, NULL);
 
 	/* Disable power to the EPD panel */
-	regulator_disable(fb_data->vcom_regulator);
-	regulator_disable(fb_data->display_regulator);
-
-	/* Disable clocks to EPDC */
-	__raw_writel(EPDC_CTRL_CLKGATE, EPDC_CTRL_SET);
-	clk_disable_unprepare(fb_data->epdc_clk_pix);
-	clk_disable_unprepare(fb_data->epdc_clk_axi);
-
-	pm_runtime_put_sync_suspend(fb_data->dev);
-
-	/* turn off the V3p3 */
-	regulator_disable(fb_data->v3p3_regulator);
+	epdc_panel_powerdown_locked(fb_data);
+	epdc_powerdown_clocks_locked(fb_data);
 
 	fb_data->power_state = POWER_STATE_OFF;
 	fb_data->powering_down = false;
@@ -1496,7 +2260,406 @@ static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
 		complete(&fb_data->powerdown_compl);
 	}
 
+	if (trace)
+		epdc_pm_trace_capture_locked(fb_data,
+			E70Q10_PM_EPDC_CLOCK_OFF, false, false, 0, NULL);
+	}
+
+/* Boot Mode0 uses the original powerdown semantics and must not depend on
+ * runtime update bookkeeping or PxP state.
+ */
+static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
+{
+	mutex_lock(&fb_data->power_mutex);
+	epdc_powerdown_locked(fb_data, false);
 	mutex_unlock(&fb_data->power_mutex);
+}
+
+static int epdc_runtime_powerdown(struct mxc_epdc_fb_data *fb_data)
+{
+	int ret;
+
+	ret = epdc_wait_for_hw_idle(fb_data, true, 5000, NULL);
+	mutex_lock(&fb_data->queue_mutex);
+	mutex_lock(&fb_data->power_mutex);
+	if (ret) {
+		if (fb_data->power_state == POWER_STATE_ON)
+			fb_data->powering_down = false;
+		if (fb_data->wait_for_powerdown) {
+			fb_data->wait_for_powerdown = false;
+			complete(&fb_data->powerdown_compl);
+		}
+		dev_warn_ratelimited(fb_data->dev,
+			"EPDC runtime powerdown refused: hardware not idle (%d)\n",
+			ret);
+		goto out;
+	}
+
+	/* Recheck under the same locks held through panel and clock shutdown. */
+	if (!fb_data->powering_down ||
+	    fb_data->power_state == POWER_STATE_OFF) {
+		ret = 0;
+		goto out;
+	}
+	ret = epdc_hw_idle_locked(fb_data, true);
+	if (ret) {
+		fb_data->powering_down = false;
+		if (fb_data->wait_for_powerdown) {
+			fb_data->wait_for_powerdown = false;
+			complete(&fb_data->powerdown_compl);
+		}
+		dev_warn_ratelimited(fb_data->dev,
+			"EPDC runtime powerdown cancelled by final idle check (%d)\n",
+			ret);
+		goto out;
+	}
+
+	epdc_powerdown_locked(fb_data, true);
+	ret = 0;
+out:
+	mutex_unlock(&fb_data->power_mutex);
+	mutex_unlock(&fb_data->queue_mutex);
+	return ret;
+}
+
+static unsigned int epdc_recovery_count_list(struct list_head *head)
+{
+	struct list_head *pos;
+	unsigned int count = 0;
+
+	list_for_each(pos, head)
+		count++;
+	return count;
+}
+
+/* Fault-only register/software snapshot, called after worker quiescence. */
+static void epdc_recovery_dump(struct mxc_epdc_fb_data *fb_data,
+			      const char *reason)
+{
+	u64 active_luts;
+
+	mutex_lock(&fb_data->queue_mutex);
+	mutex_lock(&fb_data->power_mutex);
+	if (fb_data->power_state != POWER_STATE_ON ||
+	    !fb_data->epdc_clocks_enabled) {
+		dev_err_ratelimited(fb_data->dev,
+			"EPDC %s: register dump skipped; block/clock is off state=%d clocks=%u active=%u pending=%u queued=%u collision=%u cur=%u\n",
+			reason, fb_data->power_state,
+			fb_data->epdc_clocks_enabled, fb_data->updates_active,
+			epdc_recovery_count_list(&fb_data->upd_pending_list),
+			epdc_recovery_count_list(&fb_data->upd_buf_queue),
+			epdc_recovery_count_list(&fb_data->upd_buf_collision_list),
+			fb_data->cur_update != NULL);
+		mutex_unlock(&fb_data->power_mutex);
+		mutex_unlock(&fb_data->queue_mutex);
+		return;
+	}
+	active_luts = (u64)__raw_readl(EPDC_STATUS_LUTS) |
+		((u64)__raw_readl(EPDC_STATUS_LUTS2) << 32);
+	dev_err_ratelimited(fb_data->dev,
+		"EPDC %s: CTRL=%08x WV=%08x WB=%08x RES=%08x FORMAT=%08x FIFO=%08x\n",
+		reason, __raw_readl(EPDC_CTRL), __raw_readl(EPDC_WVADDR),
+		__raw_readl(EPDC_WB_ADDR), __raw_readl(EPDC_RES),
+		__raw_readl(EPDC_FORMAT), __raw_readl(EPDC_FIFOCTRL));
+	dev_err_ratelimited(fb_data->dev,
+		"EPDC %s: UPD=%08x STRIDE=%08x CORD=%08x SIZE=%08x CTRL=%08x TEMP=%08x AUTOWV=%08x TCE=%08x\n",
+		reason, __raw_readl(EPDC_UPD_ADDR),
+		__raw_readl(EPDC_UPD_STRIDE), __raw_readl(EPDC_UPD_CORD),
+		__raw_readl(EPDC_UPD_SIZE), __raw_readl(EPDC_UPD_CTRL),
+		__raw_readl(EPDC_TEMP), __raw_readl(EPDC_AUTOWV_LUT),
+		__raw_readl(EPDC_TCE_CTRL));
+	dev_err_ratelimited(fb_data->dev,
+		"EPDC %s: STATUS=%08x LUTS=%016llx IRQ=%08x MASK=%08x state=%d active=%u idle=%u down=%u pending=%u queued=%u collision=%u cur=%u pxp_lut=%x underruns=%d\n",
+		reason, __raw_readl(EPDC_STATUS),
+		(unsigned long long)active_luts, __raw_readl(EPDC_IRQ),
+		__raw_readl(EPDC_IRQ_MASK),
+		atomic_read(&fb_data->epdc_recovery_state),
+		fb_data->updates_active, fb_data->waiting_for_idle,
+		fb_data->powering_down,
+		epdc_recovery_count_list(&fb_data->upd_pending_list),
+		epdc_recovery_count_list(&fb_data->upd_buf_queue),
+		epdc_recovery_count_list(&fb_data->upd_buf_collision_list),
+		fb_data->cur_update != NULL,
+		fb_data->pxp_conf.proc_data.lut_transform,
+		atomic_read(&fb_data->tce_underrun_count));
+	mutex_unlock(&fb_data->power_mutex);
+	mutex_unlock(&fb_data->queue_mutex);
+	if (fb_data->pxp_debug_chan)
+		pxp_dump_state(fb_data->pxp_debug_chan, fb_data->dev);
+}
+
+static void epdc_complete_marker_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_marker_data *marker, int result)
+{
+	if (!list_empty(&marker->upd_list))
+		list_del_init(&marker->upd_list);
+	if (!list_empty(&marker->full_list))
+		list_del_init(&marker->full_list);
+	marker->result = result;
+	if (marker->retained_sleep) {
+		if (list_empty(&marker->sleep_done_list))
+			list_add_tail(&marker->sleep_done_list,
+				      &fb_data->sleep_marker_done_list);
+		complete_all(&marker->update_completion);
+	} else if (marker->waiting) {
+		complete(&marker->update_completion);
+	} else {
+		kfree(marker);
+	}
+}
+
+static void epdc_recovery_fail_marker_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_marker_data *marker)
+{
+	epdc_complete_marker_locked(fb_data, marker, -EIO);
+}
+
+static void epdc_recovery_fail_all_markers_locked(
+		struct mxc_epdc_fb_data *fb_data)
+{
+	struct update_marker_data *marker, *tmp;
+
+	list_for_each_entry_safe(marker, tmp, &fb_data->full_marker_list,
+				 full_list)
+		epdc_recovery_fail_marker_locked(fb_data, marker);
+}
+
+static void epdc_recovery_fail_desc_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *desc, bool *had_alt_buffer)
+{
+	struct update_marker_data *marker, *tmp;
+
+	if (!desc)
+		return;
+	if (desc->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER)
+		*had_alt_buffer = true;
+	list_for_each_entry_safe(marker, tmp, &desc->upd_marker_list, upd_list)
+		epdc_recovery_fail_marker_locked(fb_data, marker);
+	if (epdc_is_full_panel_gc16_cleanup(fb_data, &desc->upd_data)) {
+		fb_data->cleanup_fence_active = false;
+		fb_data->cleanup_fence_lut = INVALID_LUT;
+	}
+	epdc_free_update_desc_locked(fb_data, desc);
+}
+
+static void epdc_recovery_fail_update_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_data_list *update, bool *had_alt_buffer)
+{
+	if (!update)
+		return;
+	epdc_recovery_fail_desc_locked(fb_data, update->update_desc,
+					 had_alt_buffer);
+	update->update_desc = NULL;
+	list_del_init(&update->list);
+	list_add_tail(&update->list, &fb_data->upd_buf_free_list);
+}
+
+static bool epdc_recovery_drop_queued_state_locked(
+		struct mxc_epdc_fb_data *fb_data)
+{
+	struct update_desc_list *desc, *tmp_desc;
+	struct update_data_list *update, *tmp_update;
+	struct update_marker_data *marker, *tmp_marker;
+	bool had_alt_buffer = false;
+
+	list_for_each_entry_safe(desc, tmp_desc, &fb_data->upd_pending_list,
+				 list) {
+		list_del_init(&desc->list);
+		epdc_recovery_fail_desc_locked(fb_data, desc, &had_alt_buffer);
+	}
+	if (fb_data->cur_update) {
+		update = fb_data->cur_update;
+		fb_data->cur_update = NULL;
+		epdc_recovery_fail_update_locked(fb_data, update,
+						 &had_alt_buffer);
+	}
+	list_for_each_entry_safe(update, tmp_update, &fb_data->upd_buf_queue,
+				 list)
+		epdc_recovery_fail_update_locked(fb_data, update,
+						 &had_alt_buffer);
+	list_for_each_entry_safe(update, tmp_update,
+				 &fb_data->upd_buf_collision_list, list)
+		epdc_recovery_fail_update_locked(fb_data, update,
+						 &had_alt_buffer);
+	list_for_each_entry_safe(marker, tmp_marker, &fb_data->full_marker_list,
+				 full_list)
+		epdc_recovery_fail_marker_locked(fb_data, marker);
+
+	memset(fb_data->lut_update_order, 0,
+	       fb_data->num_luts * sizeof(*fb_data->lut_update_order));
+	fb_data->epdc_colliding_luts = 0;
+	fb_data->luts_complete_wb = 0;
+	fb_data->cleanup_fence_active = false;
+	fb_data->cleanup_fence_lut = INVALID_LUT;
+	fb_data->updates_active = false;
+	fb_data->waiting_for_wb = false;
+	fb_data->waiting_for_lut = false;
+	fb_data->waiting_for_lut15 = false;
+	if (fb_data->waiting_for_idle) {
+		fb_data->waiting_for_idle = false;
+		complete_all(&fb_data->updates_done);
+	}
+	return had_alt_buffer;
+}
+
+static bool epdc_request_recovery(struct mxc_epdc_fb_data *fb_data)
+{
+	unsigned long flags;
+	bool schedule = false;
+
+	spin_lock_irqsave(&fb_data->epdc_recovery_lock, flags);
+	if (!atomic_read(&fb_data->epdc_recovery_state)) {
+		reinit_completion(&fb_data->epdc_recovery_done);
+		fb_data->epdc_recovery_result = -EINPROGRESS;
+		atomic_set(&fb_data->epdc_recovery_state, 1);
+		schedule = true;
+	}
+	spin_unlock_irqrestore(&fb_data->epdc_recovery_lock, flags);
+	if (schedule)
+		schedule_work(&fb_data->epdc_recovery_work);
+	return schedule;
+}
+
+static void epdc_finish_recovery(struct mxc_epdc_fb_data *fb_data, int ret)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&fb_data->epdc_recovery_lock, flags);
+	fb_data->epdc_recovery_result = ret;
+	atomic_set(&fb_data->epdc_recovery_state, ret ? 2 : 0);
+	complete_all(&fb_data->epdc_recovery_done);
+	spin_unlock_irqrestore(&fb_data->epdc_recovery_lock, flags);
+}
+
+static void epdc_recovery_work_func(struct work_struct *work)
+{
+	struct mxc_epdc_fb_data *fb_data =
+		container_of(work, struct mxc_epdc_fb_data, epdc_recovery_work);
+	struct mxcfb_update_data update;
+	unsigned long timeout;
+	int tce_count;
+	int ret = 0;
+	int i;
+	bool irq_disabled = false;
+	bool had_alt_buffer;
+
+	tce_count = atomic_read(&fb_data->tce_underrun_count);
+	dev_err_ratelimited(fb_data->dev,
+		"EPDC recovery started (underruns=%d)\n", tce_count);
+	disable_irq(fb_data->epdc_irq);
+	irq_disabled = true;
+	cancel_work_sync(&fb_data->epdc_intr_work);
+
+	/* Wake only the resource waits that the submit worker is actually in. */
+	mutex_lock(&fb_data->queue_mutex);
+	if (fb_data->waiting_for_wb) {
+		fb_data->waiting_for_wb = false;
+		complete_all(&fb_data->update_res_free);
+	}
+	if (fb_data->waiting_for_lut) {
+		fb_data->waiting_for_lut = false;
+		complete_all(&fb_data->update_res_free);
+	}
+	if (fb_data->waiting_for_lut15) {
+		fb_data->waiting_for_lut15 = false;
+		complete_all(&fb_data->lut15_free);
+	}
+	mutex_unlock(&fb_data->queue_mutex);
+
+	cancel_work(&fb_data->epdc_submit_work);
+	timeout = jiffies + msecs_to_jiffies(5000);
+	for (i = 0; i < 500; i++) {
+		cancel_work(&fb_data->epdc_submit_work);
+		if (!(work_busy(&fb_data->epdc_submit_work) & WORK_BUSY_RUNNING))
+			break;
+		if (time_after_eq(jiffies, timeout))
+			break;
+		msleep(10);
+	}
+	if (work_busy(&fb_data->epdc_submit_work) & WORK_BUSY_RUNNING) {
+		ret = -ETIMEDOUT;
+		goto fail;
+	}
+	cancel_work(&fb_data->epdc_submit_work);
+	epdc_recovery_dump(fb_data, "before-recovery");
+
+	cancel_delayed_work_sync(&fb_data->epdc_done_work);
+	mutex_lock(&fb_data->power_mutex);
+	fb_data->powering_down = false;
+	mutex_unlock(&fb_data->power_mutex);
+
+	mutex_lock(&fb_data->queue_mutex);
+	had_alt_buffer = epdc_recovery_drop_queued_state_locked(fb_data);
+	mutex_unlock(&fb_data->queue_mutex);
+
+	ret = epdc_init_settings_runtime(fb_data);
+	if (ret)
+		goto fail;
+
+	enable_irq(fb_data->epdc_irq);
+	irq_disabled = false;
+
+	if (had_alt_buffer) {
+		dev_err(fb_data->dev,
+			"EPDC recovery cannot reconstruct an outstanding alternate-buffer update\n");
+		ret = -EIO;
+		goto fail;
+	}
+
+	if (fb_data->blank == FB_BLANK_UNBLANK) {
+		memset(&update, 0, sizeof(update));
+		update.update_region.left = 0;
+		update.update_region.top = 0;
+		update.update_region.width = fb_data->epdc_fb_var.xres;
+		update.update_region.height = fb_data->epdc_fb_var.yres;
+		update.update_mode = UPDATE_MODE_FULL;
+		update.waveform_mode = fb_data->wv_modes.mode_gc16;
+		update.temp = TEMP_USE_AMBIENT;
+
+		mutex_lock(&fb_data->queue_mutex);
+		fb_data->recovery_refresh_active = true;
+		mutex_unlock(&fb_data->queue_mutex);
+		ret = __mxc_epdc_fb_send_single_update(&update, &fb_data->info,
+						      true, NULL, 0);
+		if (!ret)
+			ret = mxc_epdc_fb_flush_updates(fb_data);
+		mutex_lock(&fb_data->queue_mutex);
+		fb_data->recovery_refresh_active = false;
+		if (!ret && (!list_empty(&fb_data->upd_pending_list) ||
+			     !list_empty(&fb_data->upd_buf_queue) ||
+			     !list_empty(&fb_data->upd_buf_collision_list) ||
+			     fb_data->cur_update || fb_data->updates_active ||
+			     epdc_recovery_count_list(&fb_data->upd_buf_free_list) !=
+				fb_data->max_num_updates))
+			ret = -EIO;
+		mutex_unlock(&fb_data->queue_mutex);
+		if (ret)
+			goto fail;
+		if (atomic_read(&fb_data->tce_underrun_count) != tce_count) {
+			ret = -EIO;
+			goto fail;
+		}
+	}
+
+	dev_info(fb_data->dev, "EPDC recovery completed\n");
+	epdc_finish_recovery(fb_data, 0);
+	return;
+
+fail:
+	if (irq_disabled)
+		enable_irq(fb_data->epdc_irq);
+	mutex_lock(&fb_data->queue_mutex);
+	fb_data->recovery_refresh_active = false;
+	epdc_recovery_fail_all_markers_locked(fb_data);
+	mutex_unlock(&fb_data->queue_mutex);
+	dev_err(fb_data->dev,
+		"EPDC recovery failed (%d); updates remain blocked\n", ret);
+	epdc_recovery_dump(fb_data, "recovery-failed");
+	epdc_finish_recovery(fb_data, ret ? ret : -EIO);
 }
 
 static void epdc_init_sequence(struct mxc_epdc_fb_data *fb_data)
@@ -2132,6 +3295,7 @@ int mxc_epdc_fb_set_upd_scheme(u32 upd_scheme, struct fb_info *info)
 {
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
+	int ret;
 
 	dev_dbg(fb_data->dev, "Setting optimization level to %d\n", upd_scheme);
 
@@ -2139,7 +3303,9 @@ int mxc_epdc_fb_set_upd_scheme(u32 upd_scheme, struct fb_info *info)
 	 * Can't change the scheme until current updates have completed.
 	 * This function returns when all active updates are done.
 	 */
-	mxc_epdc_fb_flush_updates(fb_data);
+	ret = mxc_epdc_fb_flush_updates(fb_data);
+	if (ret)
+		return ret;
 
 	if ((upd_scheme == UPDATE_SCHEME_SNAPSHOT)
 		|| (upd_scheme == UPDATE_SCHEME_QUEUE)
@@ -2182,8 +3348,13 @@ static void copy_before_process(struct mxc_epdc_fb_data *fb_data,
 	} else {
 		src_upd_region = &upd_data->update_region;
 		src_stride = fb_data->epdc_fb_var.xres_virtual * bpp/8;
-		src_ptr = fb_data->info.screen_base + fb_data->fb_offset
-			+ src_upd_region->top * src_stride;
+		if (upd_data_list->update_desc->source_snapshot)
+			src_ptr = (u8 *)upd_data_list->update_desc->source_snapshot->virt_addr
+				+ src_upd_region->top * src_stride;
+		else
+			src_ptr = (u8 *)fb_data->info.screen_base
+				+ upd_data_list->update_desc->fb_offset
+				+ src_upd_region->top * src_stride;
 	}
 
 	temp_buf_stride = ALIGN(src_upd_region->width, 8) * bpp/8;
@@ -2197,9 +3368,13 @@ static void copy_before_process(struct mxc_epdc_fb_data *fb_data,
 		memcpy(temp_buf_ptr, src_ptr + left_offs,
 			src_upd_region->width * bpp/8);
 
-		/* Clear any unwanted pixels at the end of each line */
+		/*
+		 * Pixels outside the visible 1404-wide source are still consumed by
+		 * PxP's 8x8 block. White is the only safe E-Ink padding value; zero
+		 * created a black block at the rotated panel edge.
+		 */
 		if (src_upd_region->width & 0x7) {
-			memset(temp_buf_ptr + right_offs, 0x0,
+			memset(temp_buf_ptr + right_offs, 0xff,
 				x_trailing_bytes);
 		}
 
@@ -2212,8 +3387,421 @@ static void copy_before_process(struct mxc_epdc_fb_data *fb_data,
 		y_trailing_bytes = (ALIGN(src_upd_region->height, 8)
 			- src_upd_region->height) *
 			ALIGN(src_upd_region->width, 8) * bpp/8;
-		memset(temp_buf_ptr, 0x0, y_trailing_bytes);
+		memset(temp_buf_ptr, 0xff, y_trailing_bytes);
 	}
+}
+
+
+static bool epdc_is_full_panel_gc16_cleanup(
+				struct mxc_epdc_fb_data *fb_data,
+				const struct mxcfb_update_data *upd)
+{
+	const struct mxcfb_rect *region;
+
+	if (!fb_data || !upd)
+		return false;
+
+	region = &upd->update_region;
+	return upd->update_mode == UPDATE_MODE_FULL &&
+		upd->waveform_mode == fb_data->wv_modes.mode_gc16 &&
+		region->left == 0 &&
+		region->top == 0 &&
+		region->width == fb_data->epdc_fb_var.xres &&
+		region->height == fb_data->epdc_fb_var.yres;
+}
+
+static bool epdc_is_cleanup_desc(struct mxc_epdc_fb_data *fb_data,
+						 const struct update_desc_list *desc)
+{
+	return epdc_is_full_panel_gc16_cleanup(fb_data,
+		desc ? &desc->upd_data : NULL);
+}
+
+struct epdc_pending_coalesce_plan {
+	struct update_desc_list *oldest;
+	struct mxcfb_rect damage;
+	u32 desc_count;
+	u32 generation_count;
+	u32 damage_expands;
+};
+
+static bool epdc_rect_valid_for_coalesce(struct mxc_epdc_fb_data *fb_data,
+					 const struct mxcfb_rect *rect)
+{
+	u32 xres = fb_data->epdc_fb_var.xres;
+	u32 yres = fb_data->epdc_fb_var.yres;
+
+	return rect->width && rect->height &&
+		rect->left < xres && rect->top < yres &&
+		rect->width <= xres - rect->left &&
+		rect->height <= yres - rect->top;
+}
+
+static bool epdc_coalesce_union_fits(struct mxc_epdc_fb_data *fb_data,
+				     const struct mxcfb_rect *a,
+				     const struct mxcfb_rect *b,
+				     struct mxcfb_rect *combined)
+{
+	u32 right_a, right_b, bottom_a, bottom_b;
+
+	if (!epdc_rect_valid_for_coalesce(fb_data, a) ||
+	    !epdc_rect_valid_for_coalesce(fb_data, b))
+		return false;
+
+	right_a = a->left + a->width;
+	right_b = b->left + b->width;
+	bottom_a = a->top + a->height;
+	bottom_b = b->top + b->height;
+	combined->left = min(a->left, b->left);
+	combined->top = min(a->top, b->top);
+	combined->width = max(right_a, right_b) - combined->left;
+	combined->height = max(bottom_a, bottom_b) - combined->top;
+
+	if (fb_data->restrict_width) {
+		u32 max_width = EPDC_V2_MAX_UPDATE_WIDTH;
+		u32 combined_width = combined->width;
+
+		if (fb_data->epdc_fb_var.rotate != FB_ROTATE_UR)
+			max_width -= EPDC_V2_ROTATION_ALIGNMENT;
+		if ((fb_data->epdc_fb_var.rotate == FB_ROTATE_CW) ||
+		    (fb_data->epdc_fb_var.rotate == FB_ROTATE_CCW))
+			combined_width = combined->height;
+		if (combined_width > max_width)
+			return false;
+	}
+
+	return true;
+}
+
+static bool epdc_is_ordinary_display_update(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *desc, bool require_snapshot)
+{
+	if (!desc || desc->upd_data.update_marker != 0 ||
+	    desc->upd_data.update_mode != UPDATE_MODE_PARTIAL ||
+	    desc->upd_data.waveform_mode != WAVEFORM_MODE_AUTO ||
+	    desc->upd_data.temp != TEMP_USE_AMBIENT ||
+	    desc->upd_data.flags != 0 ||
+	    epdc_is_cleanup_desc(fb_data, desc) ||
+	    !epdc_rect_valid_for_coalesce(fb_data,
+					   &desc->upd_data.update_region))
+		return false;
+
+	if (require_snapshot &&
+	    (!desc->source_snapshot ||
+	     desc->source_snapshot->generation != desc->fb_source_generation ||
+	     desc->source_snapshot->fb_offset != desc->fb_offset))
+		return false;
+
+	return true;
+}
+
+static bool epdc_is_ordinary_ui_update(struct mxc_epdc_fb_data *fb_data,
+					       struct update_desc_list *desc,
+					       bool require_snapshot)
+{
+	return desc && !desc->collision_resubmit &&
+		epdc_is_ordinary_display_update(fb_data, desc, require_snapshot);
+}
+
+static bool epdc_is_ordinary_collision_update(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *desc)
+{
+	return epdc_is_ordinary_display_update(fb_data, desc, false) &&
+		list_empty(&desc->upd_marker_list);
+}
+
+/*
+ * Collapse only a compatible suffix of upd_pending_list.  The submit worker
+ * removes descriptors under the same queue_mutex, so anything no longer on
+ * this list is already worker-owned and is deliberately outside this policy.
+ */
+static bool epdc_plan_pending_coalesce_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *newest,
+		struct epdc_pending_coalesce_plan *plan)
+{
+	struct update_desc_list *candidate;
+	u64 last_generation = 0;
+	bool have_generation = false;
+
+	memset(plan, 0, sizeof(*plan));
+	if (!fb_data->source_snapshot_enabled ||
+	    fb_data->upd_scheme != UPDATE_SCHEME_QUEUE_AND_MERGE)
+		return false;
+
+	if (!epdc_is_ordinary_ui_update(fb_data, newest, false)) {
+		fb_data->coalesce_skipped_ineligible++;
+		if (newest->upd_data.update_marker != 0)
+			fb_data->coalesce_marker_skips++;
+		return false;
+	}
+
+	fb_data->coalesce_passes++;
+	plan->damage = newest->upd_data.update_region;
+	if (list_empty(&fb_data->upd_pending_list))
+		return true;
+
+	list_for_each_entry_reverse(candidate, &fb_data->upd_pending_list, list) {
+		struct mxcfb_rect combined;
+		const u64 generation = candidate->fb_source_generation;
+
+		if (candidate->upd_data.update_marker != 0) {
+			fb_data->coalesce_marker_skips++;
+			break;
+		}
+		if (!epdc_is_ordinary_ui_update(fb_data, candidate, true) ||
+		    candidate->update_order >= newest->update_order ||
+		    generation > newest->fb_source_generation ||
+		    candidate->upd_data.update_mode != newest->upd_data.update_mode ||
+		    candidate->upd_data.waveform_mode != newest->upd_data.waveform_mode ||
+		    candidate->upd_data.temp != newest->upd_data.temp ||
+		    candidate->upd_data.flags != newest->upd_data.flags) {
+			fb_data->coalesce_skipped_ineligible++;
+			break;
+		}
+
+		if (!epdc_coalesce_union_fits(fb_data, &plan->damage,
+					      &candidate->upd_data.update_region,
+					      &combined))
+			break;
+
+		if (combined.left != plan->damage.left ||
+		    combined.top != plan->damage.top ||
+		    combined.width != plan->damage.width ||
+		    combined.height != plan->damage.height)
+			plan->damage_expands++;
+		plan->damage = combined;
+		plan->oldest = candidate;
+		plan->desc_count++;
+		if (!have_generation || generation != last_generation) {
+			plan->generation_count++;
+			last_generation = generation;
+			have_generation = true;
+		}
+	}
+
+	return true;
+}
+
+static bool epdc_reuse_pending_snapshot_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *newest,
+		const struct epdc_pending_coalesce_plan *plan)
+{
+	struct e70q10_source_snapshot *slot = NULL;
+	struct update_desc_list *candidate;
+	u32 i;
+
+	if (!plan->desc_count || !plan->oldest ||
+	    !fb_data->source_snapshots ||
+	    (u64)newest->fb_offset + fb_data->source_snapshot_copy_size >
+			(u64)fb_data->map_size)
+		return false;
+
+	for (i = 0; i < fb_data->source_snapshot_count; i++) {
+		struct e70q10_source_snapshot *possible =
+			&fb_data->source_snapshots[i];
+		u32 pending_refs = 0;
+
+		list_for_each_entry_reverse(candidate,
+					    &fb_data->upd_pending_list, list) {
+			if (candidate->source_snapshot == possible)
+				pending_refs++;
+			if (candidate == plan->oldest)
+				break;
+		}
+		/* No worker, active, collision, or older pending descriptor may
+		 * still read a slot that is overwritten with the newest frame. */
+		if (pending_refs && possible->refs == pending_refs) {
+			slot = possible;
+			break;
+		}
+	}
+	if (!slot)
+		return false;
+
+	memcpy(slot->virt_addr,
+	       (u8 *)fb_data->info.screen_base + newest->fb_offset,
+	       fb_data->source_snapshot_copy_size);
+	if (fb_data->source_snapshot_size > fb_data->source_snapshot_copy_size)
+		memset((u8 *)slot->virt_addr + fb_data->source_snapshot_copy_size,
+		       0xff, fb_data->source_snapshot_size -
+		       fb_data->source_snapshot_copy_size);
+	wmb();
+	slot->fb_offset = newest->fb_offset;
+	slot->generation = newest->fb_source_generation;
+	slot->refs++; /* new descriptor reference; pending refs are put below */
+	newest->source_snapshot = slot;
+	fb_data->source_snapshot_copies++;
+	return true;
+}
+
+static void epdc_apply_pending_coalesce_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *newest,
+		const struct epdc_pending_coalesce_plan *plan)
+{
+	struct update_desc_list *candidate;
+	bool done;
+
+	if (!plan->desc_count || !plan->oldest)
+		return;
+
+	newest->upd_data.update_region = plan->damage;
+	for (;;) {
+		candidate = list_entry(fb_data->upd_pending_list.prev,
+				       struct update_desc_list, list);
+		done = candidate == plan->oldest;
+		list_del_init(&candidate->list);
+		epdc_free_update_desc_locked(fb_data, candidate);
+		fb_data->coalesce_superseded_descs++;
+		if (done)
+			break;
+	}
+	fb_data->coalesce_superseded_generations +=
+		plan->generation_count;
+	fb_data->coalesce_damage_expands += plan->damage_expands;
+	if (plan->damage.left == 0 && plan->damage.top == 0 &&
+	    plan->damage.width == fb_data->epdc_fb_var.xres &&
+	    plan->damage.height == fb_data->epdc_fb_var.yres)
+		fb_data->coalesce_full_bounds++;
+}
+
+/*
+ * Preserve one newest ordinary framebuffer state when all normal immutable
+ * snapshots are owned by worker/active/collision descriptors.  This reserve
+ * is never submitted directly: the submit worker first copies it into a normal
+ * free snapshot slot, so the reserve remains a bounded pending-state latch.
+ */
+static bool e70q10_defer_latest_update_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_desc_list *newest,
+		const struct epdc_pending_coalesce_plan *plan)
+{
+	struct update_desc_list *deferred = fb_data->deferred_latest_desc;
+	struct update_desc_list *candidate, *tmp;
+	struct e70q10_source_snapshot *reserve =
+		&fb_data->deferred_latest_snapshot;
+	struct mxcfb_rect damage;
+
+	if (!fb_data->deferred_latest_enabled ||
+	    fb_data->upd_scheme != UPDATE_SCHEME_QUEUE_AND_MERGE ||
+	    !epdc_is_ordinary_ui_update(fb_data, newest, false) ||
+	    !plan || !epdc_rect_valid_for_coalesce(fb_data,
+						&newest->upd_data.update_region) ||
+	    (u64)newest->fb_offset + fb_data->source_snapshot_copy_size >
+			(u64)fb_data->map_size)
+		return false;
+
+	damage = plan->damage;
+	if (deferred) {
+		if (list_empty(&fb_data->upd_pending_list) ||
+		    deferred->source_snapshot != reserve ||
+		    !deferred->deferred_latest || !plan->desc_count ||
+		    !plan->oldest || newest->update_order <= deferred->update_order)
+			return false;
+
+		e70q10_copy_frame_to_snapshot_locked(fb_data, reserve,
+			newest->fb_offset, newest->fb_source_generation);
+		fb_data->source_snapshot_copies++;
+		if (fb_data->upd_pending_list.prev != &deferred->list) {
+			/*
+			 * A marker, cleanup, or other barrier may have been queued after
+			 * the old latch. Keep those descriptors in order and move the
+			 * latest ordinary state behind them. Use full-screen damage because
+			 * the intervening barrier may have changed any panel pixel.
+			 */
+			deferred->upd_data = newest->upd_data;
+			deferred->upd_data.update_region.left = 0;
+			deferred->upd_data.update_region.top = 0;
+			deferred->upd_data.update_region.width =
+				fb_data->epdc_fb_var.xres;
+			deferred->upd_data.update_region.height =
+				fb_data->epdc_fb_var.yres;
+			deferred->fb_offset = newest->fb_offset;
+			deferred->fb_source_generation =
+				newest->fb_source_generation;
+			deferred->fb_page_index = newest->fb_page_index;
+			deferred->fb_page_generation =
+				newest->fb_page_generation;
+			deferred->fb_page_generation_valid =
+				newest->fb_page_generation_valid;
+			deferred->update_order = newest->update_order;
+			reserve->fb_offset = newest->fb_offset;
+			reserve->generation = newest->fb_source_generation;
+			list_move_tail(&deferred->list,
+				&fb_data->upd_pending_list);
+			fb_data->deferred_latest_retry_replaced++;
+			fb_data->latest_accepted_generation = max(
+				fb_data->latest_accepted_generation,
+				newest->fb_source_generation);
+			e70q10_source_snapshot_put_locked(fb_data,
+				newest->source_snapshot);
+			newest->source_snapshot = NULL;
+			kfree(newest);
+			return true;
+		}
+
+		list_for_each_entry_safe_reverse(candidate, tmp,
+						 &fb_data->upd_pending_list, list) {
+			if (candidate == deferred) {
+				if (candidate == plan->oldest)
+					break;
+				continue;
+			}
+			{
+				bool done = candidate == plan->oldest;
+
+				list_del_init(&candidate->list);
+				e70q10_source_snapshot_put_locked(fb_data,
+					candidate->source_snapshot);
+				candidate->source_snapshot = NULL;
+				kfree(candidate);
+				fb_data->coalesce_superseded_descs++;
+				if (done)
+					break;
+			}
+		}
+
+		deferred->upd_data = newest->upd_data;
+		deferred->upd_data.update_region = damage;
+		deferred->fb_offset = newest->fb_offset;
+		deferred->fb_source_generation = newest->fb_source_generation;
+		deferred->fb_page_index = newest->fb_page_index;
+		deferred->fb_page_generation = newest->fb_page_generation;
+		deferred->fb_page_generation_valid =
+			newest->fb_page_generation_valid;
+		deferred->update_order = newest->update_order;
+		reserve->fb_offset = newest->fb_offset;
+		reserve->generation = newest->fb_source_generation;
+		fb_data->deferred_latest_retry_replaced++;
+		fb_data->coalesce_superseded_generations +=
+			plan->generation_count;
+		fb_data->latest_accepted_generation = max(
+			fb_data->latest_accepted_generation,
+			newest->fb_source_generation);
+		epdc_free_update_desc_locked(fb_data, newest);
+		return true;
+	}
+
+	if (reserve->refs)
+		return false;
+	e70q10_copy_frame_to_snapshot_locked(fb_data, reserve,
+		newest->fb_offset, newest->fb_source_generation);
+	fb_data->source_snapshot_copies++;
+	reserve->refs = 1;
+	newest->source_snapshot = reserve;
+	newest->deferred_latest = true;
+	if (plan->desc_count)
+		epdc_apply_pending_coalesce_locked(fb_data, newest, plan);
+	list_add_tail(&newest->list, &fb_data->upd_pending_list);
+	fb_data->deferred_latest_desc = newest;
+	fb_data->deferred_latest_retry_armed++;
+	fb_data->latest_accepted_generation =
+		newest->fb_source_generation;
+	return true;
 }
 
 static int epdc_process_update(struct update_data_list *upd_data_list,
@@ -2221,20 +3809,25 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 {
 	struct mxcfb_rect *src_upd_region; /* Region of src buffer for update */
 	struct mxcfb_rect pxp_upd_region;
+	struct mxcfb_rect pxp_region_before_origin_align;
+	struct mxcfb_rect process_region;
 	u32 src_width, src_height;
 	u32 offset_from_4, bytes_per_pixel;
 	u32 post_rotation_xcoord, post_rotation_ycoord, width_pxp_blocks;
 	u32 pxp_input_offs, pxp_output_offs, pxp_output_shift;
+	u32 pxp_output_rows, pxp_output_bytes;
 	u32 hist_stat = 0;
 	int width_unaligned, height_unaligned;
 	bool input_unaligned = false;
 	bool line_overflow = false;
+	bool collision_unaligned;
 	int pix_per_line_added;
 	bool use_temp_buf = false;
 	struct mxcfb_rect temp_buf_upd_region;
 	struct update_desc_list *upd_desc_list = upd_data_list->update_desc;
 
 	int ret;
+
 
 	/*
 	 * Gotta do a whole bunch of buffer ptr manipulation to
@@ -2255,9 +3848,9 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 		src_height = fb_data->epdc_fb_var.yres;
 		src_upd_region = &upd_desc_list->upd_data.update_region;
 	}
+	process_region = *src_upd_region;
 
 	bytes_per_pixel = fb_data->epdc_fb_var.bits_per_pixel/8;
-
 	/*
 	 * SW workaround for PxP limitation (for pre-v2.0 HW)
 	 *
@@ -2282,7 +3875,7 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	 * at the end of each line.
 	 *
 	 * Workaround is to copy from source buffer into a temporary
-	 * buffer, which we pad with zeros to match the 8x8 alignment
+	 * buffer, which we pad with white pixels to match the 8x8 alignment
 	 * requirement. This temp buffer becomes the input to the PxP.
 	 */
 	width_unaligned = src_upd_region->width & 0x7;
@@ -2300,20 +3893,42 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 			ALIGN(src_upd_region->width + pix_per_line_added, 8)))
 		line_overflow = true;
 
+	/*
+	 * EPDC v2 returns the smallest collision rectangle in panel
+	 * coordinates. Once transformed back to framebuffer coordinates that
+	 * rectangle is not guaranteed to retain PxP's 8x8 alignment. Re-basing
+	 * an unaligned retry in the existing white-padded copy buffer keeps PxP
+	 * from reading beyond the collision rectangle without expanding the
+	 * region eventually submitted to EPDC.
+	 */
+	collision_unaligned = upd_desc_list->collision_resubmit &&
+		((src_upd_region->left | src_upd_region->top |
+		  src_upd_region->width | src_upd_region->height) & 0x7);
+
 	/* Grab pxp_mutex here so that we protect access
 	 * to copybuf in addition to the PxP structures */
 	mutex_lock(&fb_data->pxp_mutex);
 
-	if (((((width_unaligned || height_unaligned || input_unaligned) &&
+
+	if (collision_unaligned ||
+	    (((((width_unaligned || height_unaligned || input_unaligned) &&
 		(upd_desc_list->upd_data.waveform_mode == WAVEFORM_MODE_AUTO))
 		|| line_overflow) && (fb_data->rev < 20)) ||
-		fb_data->restrict_width) {
+		fb_data->restrict_width)) {
 		dev_dbg(fb_data->dev, "Copying update before processing.\n");
 
 		/* Update to reflect what the new source buffer will be */
 		src_width = ALIGN(src_upd_region->width, 8);
 		src_height = ALIGN(src_upd_region->height, 8);
 
+		/*
+		 * With an immutable snapshot, copy_before_process() no longer reads
+		 * the Android framebuffer page. Keep the legacy diagnostic for paths
+		 * where a snapshot is intentionally not used.
+		 */
+		if (!upd_desc_list->source_snapshot &&
+		    epdc_fb_page_generation_changed(fb_data, upd_desc_list))
+			epdc_record_fb_page_reuse(fb_data, true);
 		copy_before_process(fb_data, upd_data_list);
 
 		/*
@@ -2387,11 +4002,30 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	case FB_ROTATE_CCW:
 		width_pxp_blocks = pxp_upd_region.height;
 		post_rotation_xcoord = pxp_upd_region.top;
+		/*
+		 * E70Q10 is 1404 pixels wide but PxP rotation works in 8-pixel
+		 * blocks. The input is therefore processed as 1408 pixels wide;
+		 * x=1404..1407 is white padding. ROT_270 maps those four padding
+		 * columns to the first four output rows, so the EPDC must start at
+		 * row 4 for a full-width update. Do not compact row 4 to row 0:
+		 * output row 4 is logical source x=1403 (the visible right edge),
+		 * while rows 0..3 are intentionally discarded padding.
+		 */
 		post_rotation_ycoord = pxp_upd_region.width - src_upd_region->width - pxp_upd_region.left;
 		break;
 	}
 
+	if ((fb_data->epdc_fb_var.rotate == FB_ROTATE_CW) ||
+	    (fb_data->epdc_fb_var.rotate == FB_ROTATE_CCW))
+		pxp_output_rows = pxp_upd_region.width;
+	else
+		pxp_output_rows = pxp_upd_region.height;
+	pxp_output_bytes = width_pxp_blocks * pxp_output_rows;
+	if (pxp_output_bytes > fb_data->max_pix_size)
+		pxp_output_bytes = fb_data->max_pix_size;
+
 	/* Update region start coord to force PxP to process full 8x8 regions */
+	pxp_region_before_origin_align = pxp_upd_region;
 	pxp_upd_region.top &= ~0x7;
 	pxp_upd_region.left &= ~0x7;
 
@@ -2422,9 +4056,16 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 		sg_dma_address(&fb_data->sg[0]) =
 			upd_desc_list->upd_data.alt_buffer_data.phys_addr
 				+ pxp_input_offs;
-	else {
+	else if (upd_desc_list->source_snapshot) {
 		sg_dma_address(&fb_data->sg[0]) =
-			fb_data->info.fix.smem_start + fb_data->fb_offset
+			upd_desc_list->source_snapshot->phys_addr + pxp_input_offs;
+		sg_set_page(&fb_data->sg[0],
+			virt_to_page(upd_desc_list->source_snapshot->virt_addr),
+			fb_data->source_snapshot_size,
+			offset_in_page(upd_desc_list->source_snapshot->virt_addr));
+	} else {
+		sg_dma_address(&fb_data->sg[0]) =
+			fb_data->info.fix.smem_start + upd_desc_list->fb_offset
 			+ pxp_input_offs;
 		sg_set_page(&fb_data->sg[0],
 			virt_to_page(fb_data->info.screen_base),
@@ -2463,9 +4104,13 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 	if (fb_data->buf_pix_fmt == EPDC_FORMAT_BUF_PIXEL_FORMAT_P5N)
 		fb_data->pxp_conf.proc_data.lut_transform |= PXP_LUT_AA;
 
-	/* This is a blocking call, so upon return PxP tx should be done */
+
+	/* The temp/alternate source is no longer the framebuffer page. */
 	ret = pxp_process_update(fb_data, src_width, src_height,
-		&pxp_upd_region);
+		&pxp_upd_region,
+		(use_temp_buf || upd_desc_list->source_snapshot ||
+		 (upd_desc_list->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER)) ?
+			NULL : upd_desc_list);
 	if (ret) {
 		dev_err(fb_data->dev, "Unable to submit PxP update task.\n");
 		mutex_unlock(&fb_data->pxp_mutex);
@@ -2485,6 +4130,9 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 		mutex_unlock(&fb_data->pxp_mutex);
 		return ret;
 	}
+
+
+
 
 	mutex_unlock(&fb_data->pxp_mutex);
 
@@ -2528,10 +4176,22 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 	arect = &upd_desc_list->upd_data.update_region;
 	brect = &update_to_merge->upd_data.update_region;
 
+	/*
+	 * A full-panel GC16 is a physical cleanup, not just another update
+	 * candidate. Merging it with another update can turn its waveform into AUTO
+	 * below and can also change the rectangle that the marker represents. Keep it
+	 * as a queue barrier in either merge direction.
+	 */
+	if (epdc_is_full_panel_gc16_cleanup(fb_data, a) ||
+		epdc_is_full_panel_gc16_cleanup(fb_data, b)) {
+		return MERGE_BLOCK;
+	}
+
 	/* Do not merge a dry-run collision test update */
 	if ((a->flags & EPDC_FLAG_TEST_COLLISION) ||
-		(b->flags & EPDC_FLAG_TEST_COLLISION))
+		(b->flags & EPDC_FLAG_TEST_COLLISION)) {
 		return MERGE_BLOCK;
+	}
 
 	/*
 	 * Updates with different flags must be executed sequentially.
@@ -2545,8 +4205,9 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 		if ((arect->left != brect->left) ||
 			(arect->top != brect->top) ||
 			(arect->width != brect->width) ||
-			(arect->height != brect->height))
+			(arect->height != brect->height)) {
 			return MERGE_BLOCK;
+		}
 
 		use_flags = true;
 	}
@@ -2560,8 +4221,9 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 	if (arect->left > (brect->left + brect->width) ||
 		brect->left > (arect->left + arect->width) ||
 		arect->top > (brect->top + brect->height) ||
-		brect->top > (arect->top + arect->height))
+		brect->top > (arect->top + arect->height)) {
 		return MERGE_FAIL;
+	}
 
 	combine.left = arect->left < brect->left ? arect->left : brect->left;
 	combine.top = arect->top < brect->top ? arect->top : brect->top;
@@ -2583,8 +4245,9 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 		if ((fb_data->epdc_fb_var.rotate == FB_ROTATE_CW) ||
 			(fb_data->epdc_fb_var.rotate == FB_ROTATE_CCW))
 			combined_width = combine.height;
-		if (combined_width > max_width)
+		if (combined_width > max_width) {
 			return MERGE_FAIL;
+		}
 	}
 
 	*arect = combine;
@@ -2597,12 +4260,61 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 	list_splice_tail(&update_to_merge->upd_marker_list,
 		&upd_desc_list->upd_marker_list);
 
-	/* Merged update should take on the earliest order */
+	/* Merged pixels must come from the newest framebuffer snapshot. */
+	if (update_to_merge->update_order >= upd_desc_list->update_order) {
+		upd_desc_list->fb_offset = update_to_merge->fb_offset;
+		upd_desc_list->fb_source_generation =
+			update_to_merge->fb_source_generation;
+		upd_desc_list->fb_page_index = update_to_merge->fb_page_index;
+		upd_desc_list->fb_page_generation =
+			update_to_merge->fb_page_generation;
+		upd_desc_list->fb_page_generation_valid =
+			update_to_merge->fb_page_generation_valid;
+		e70q10_source_snapshot_adopt_newer_locked(fb_data,
+			upd_desc_list, update_to_merge);
+	}
+	upd_desc_list->merged = true;
+	upd_desc_list->collision_resubmit |=
+		update_to_merge->collision_resubmit;
+	upd_desc_list->deferred_retry |= update_to_merge->deferred_retry;
+	upd_desc_list->collided_newer_order = max(
+		upd_desc_list->collided_newer_order,
+		update_to_merge->collided_newer_order);
+	upd_desc_list->collided_newer_seen |=
+		update_to_merge->collided_newer_seen;
+	upd_desc_list->collision_retry_count = max(
+		upd_desc_list->collision_retry_count,
+		update_to_merge->collision_retry_count);
 	upd_desc_list->update_order =
 		(upd_desc_list->update_order > update_to_merge->update_order) ?
 		upd_desc_list->update_order : update_to_merge->update_order;
-
 	return MERGE_OK;
+}
+
+/* Keep a selected descriptor reachable while recovery waits for this worker. */
+static void epdc_recovery_park_update_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_data_list *update)
+{
+	if (update && list_empty(&update->list))
+		list_add_tail(&update->list, &fb_data->upd_buf_queue);
+}
+
+static void epdc_recovery_abort_selected_locked(
+		struct mxc_epdc_fb_data *fb_data,
+		struct update_data_list *update)
+{
+	if (atomic_read(&fb_data->epdc_recovery_state) == 2) {
+		bool had_alt_buffer = false;
+
+		epdc_recovery_fail_desc_locked(fb_data, update->update_desc,
+						 &had_alt_buffer);
+		update->update_desc = NULL;
+		if (list_empty(&update->list))
+			list_add_tail(&update->list, &fb_data->upd_buf_free_list);
+		return;
+	}
+	epdc_recovery_park_update_locked(fb_data, update);
 }
 
 static void epdc_submit_work_func(struct work_struct *work)
@@ -2623,6 +4335,12 @@ static void epdc_submit_work_func(struct work_struct *work)
 
 	/* Protect access to buffer queues and to update HW */
 	mutex_lock(&fb_data->queue_mutex);
+	if (atomic_read(&fb_data->epdc_recovery_state) &&
+	    !fb_data->recovery_refresh_active) {
+		mutex_unlock(&fb_data->queue_mutex);
+		return;
+	}
+
 
 	/*
 	 * Are any of our collision updates able to go now?
@@ -2636,11 +4354,21 @@ static void epdc_submit_work_func(struct work_struct *work)
 			continue;
 
 		dev_dbg(fb_data->dev, "A collision update is ready to go!\n");
-
-		/* Force waveform mode to auto for resubmitted collisions */
-		next_update->update_desc->upd_data.waveform_mode =
-			WAVEFORM_MODE_AUTO;
-
+		fb_data->collision_retry_zero_mask++;
+		next_update->collision_mask = 0;
+		next_update->update_desc->collision_retry_count++;
+		fb_data->collision_retry_max_depth = max_t(u64,
+			fb_data->collision_retry_max_depth,
+			next_update->update_desc->collision_retry_count);
+		next_update->update_desc->collision_resubmit = true;
+		/*
+		 * Histogram-selected AUTO is useful for ordinary collision retries,
+		 * but a full-panel GC16 cleanup must retain the waveform requested by
+		 * userspace all the way to the hardware submission.
+		 */
+		if (!epdc_is_cleanup_desc(fb_data, next_update->update_desc))
+			next_update->update_desc->upd_data.waveform_mode =
+				WAVEFORM_MODE_AUTO;
 		/*
 		 * We have a collision cleared, so select it for resubmission.
 		 * If an update is already selected, attempt to merge.
@@ -2652,14 +4380,14 @@ static void epdc_submit_work_func(struct work_struct *work)
 				/* If not merging, we have our update */
 				break;
 		} else {
-			switch (epdc_submit_merge(upd_data_list->update_desc,
-						next_update->update_desc,
-						fb_data)) {
+				switch (epdc_submit_merge(upd_data_list->update_desc,
+							next_update->update_desc,
+							fb_data)) {
 			case MERGE_OK:
 				dev_dbg(fb_data->dev,
 					"Update merged [collision]\n");
 				list_del_init(&next_update->update_desc->list);
-				kfree(next_update->update_desc);
+				epdc_free_update_desc_locked(fb_data, next_update->update_desc);
 				next_update->update_desc = NULL;
 				list_del_init(&next_update->list);
 				/* Add to free buffer list */
@@ -2709,6 +4437,9 @@ static void epdc_submit_work_func(struct work_struct *work)
 				&fb_data->upd_pending_list, list) {
 
 			dev_dbg(fb_data->dev, "Found a pending update!\n");
+			if (!e70q10_promote_deferred_snapshot_locked(fb_data,
+								 next_desc))
+				break;
 
 			if (!upd_data_list) {
 				if (list_empty(&fb_data->upd_buf_free_list))
@@ -2719,6 +4450,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 				list_del_init(&upd_data_list->list);
 				upd_data_list->update_desc = next_desc;
 				list_del_init(&next_desc->list);
+				upd_data_list->collision_mask = 0;
 				if (fb_data->upd_scheme == UPDATE_SCHEME_QUEUE)
 					/* If not merging, we have an update */
 					break;
@@ -2729,7 +4461,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 					dev_dbg(fb_data->dev,
 						"Update merged [queue]\n");
 					list_del_init(&next_desc->list);
-					kfree(next_desc);
+					epdc_free_update_desc_locked(fb_data, next_desc);
 					break;
 				case MERGE_FAIL:
 					dev_dbg(fb_data->dev,
@@ -2753,6 +4485,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 		mutex_unlock(&fb_data->queue_mutex);
 		return;
 	}
+	upd_data_list->pxp_used = false;
 
 	/*
 	 * If no processing required, skip update processing
@@ -2784,14 +4517,22 @@ static void epdc_submit_work_func(struct work_struct *work)
 		 * the update region in the frame buffer.
 		 */
 		upd_region = &upd_data_list->update_desc->upd_data.update_region;
-		update_addr = fb_data->info.fix.smem_start +
-			((upd_region->top * fb_data->info.var.xres_virtual) +
-			upd_region->left) * fb_data->info.var.bits_per_pixel/8;
+		if (upd_data_list->update_desc->source_snapshot)
+			update_addr = upd_data_list->update_desc->source_snapshot->phys_addr +
+				((upd_region->top * fb_data->info.var.xres_virtual) +
+				 upd_region->left) *
+				fb_data->info.var.bits_per_pixel/8;
+		else
+			update_addr = fb_data->info.fix.smem_start +
+				((upd_region->top * fb_data->info.var.xres_virtual) +
+				 upd_region->left) *
+				fb_data->info.var.bits_per_pixel/8;
 		upd_data_list->update_desc->epdc_stride =
 					fb_data->info.var.xres_virtual *
 					fb_data->info.var.bits_per_pixel/8;
 	} else {
 		/* Select from PxP output buffers */
+		upd_data_list->pxp_used = true;
 		upd_data_list->phys_addr =
 			fb_data->phys_addr_updbuf[fb_data->upd_buffer_num];
 		upd_data_list->virt_addr =
@@ -2804,23 +4545,41 @@ static void epdc_submit_work_func(struct work_struct *work)
 		mutex_unlock(&fb_data->queue_mutex);
 
 		/* Perform PXP processing - EPDC power will also be enabled */
-		if (epdc_process_update(upd_data_list, fb_data)) {
+		ret = epdc_process_update(upd_data_list, fb_data);
+		mutex_lock(&fb_data->queue_mutex);
+		if (atomic_read(&fb_data->epdc_recovery_state) &&
+		    !fb_data->recovery_refresh_active) {
+			epdc_recovery_abort_selected_locked(fb_data,
+							   upd_data_list);
+			mutex_unlock(&fb_data->queue_mutex);
+			return;
+		}
+		if (ret) {
 			dev_dbg(fb_data->dev, "PXP processing error.\n");
-			/* Protect access to buffer queues and to update HW */
-			mutex_lock(&fb_data->queue_mutex);
+			list_for_each_entry_safe(next_marker, temp_marker,
+					 &upd_data_list->update_desc->upd_marker_list,
+					 upd_list)
+				epdc_recovery_fail_marker_locked(fb_data, next_marker);
+			if (epdc_is_cleanup_desc(fb_data,
+					upd_data_list->update_desc)) {
+				fb_data->cleanup_fence_active = false;
+				fb_data->cleanup_fence_lut = INVALID_LUT;
+			}
+			if (upd_data_list->update_desc->deferred_retry)
+				fb_data->deferred_latest_retry_dropped_error++;
 			list_del_init(&upd_data_list->update_desc->list);
-			kfree(upd_data_list->update_desc);
+			epdc_free_update_desc_locked(fb_data, upd_data_list->update_desc);
 			upd_data_list->update_desc = NULL;
 			/* Add to free buffer list */
 			list_add_tail(&upd_data_list->list,
 				&fb_data->upd_buf_free_list);
 			/* Release buffer queues */
 			mutex_unlock(&fb_data->queue_mutex);
+			/* A freed snapshot can unblock the one-deep latest-state latch. */
+			queue_work(fb_data->epdc_submit_workqueue,
+				   &fb_data->epdc_submit_work);
 			return;
 		}
-
-		/* Protect access to buffer queues and to update HW */
-		mutex_lock(&fb_data->queue_mutex);
 
 		update_addr = upd_data_list->phys_addr
 				+ upd_data_list->update_desc->epdc_offs;
@@ -2849,6 +4608,13 @@ static void epdc_submit_work_func(struct work_struct *work)
 		mutex_unlock(&fb_data->queue_mutex);
 		wait_for_completion(&fb_data->update_res_free);
 		mutex_lock(&fb_data->queue_mutex);
+		if (atomic_read(&fb_data->epdc_recovery_state) &&
+		    !fb_data->recovery_refresh_active) {
+			epdc_recovery_abort_selected_locked(fb_data,
+							   upd_data_list);
+			mutex_unlock(&fb_data->queue_mutex);
+			return;
+		}
 	}
 
 	/*
@@ -2911,6 +4677,13 @@ static void epdc_submit_work_func(struct work_struct *work)
 		mutex_unlock(&fb_data->queue_mutex);
 		wait_for_completion(&fb_data->update_res_free);
 		mutex_lock(&fb_data->queue_mutex);
+		if (atomic_read(&fb_data->epdc_recovery_state) &&
+		    !fb_data->recovery_refresh_active) {
+			epdc_recovery_abort_selected_locked(fb_data,
+							   upd_data_list);
+			mutex_unlock(&fb_data->queue_mutex);
+			return;
+		}
 	}
 
 	ret = epdc_choose_next_lut(fb_data->rev, &upd_data_list->lut_num);
@@ -2931,6 +4704,13 @@ static void epdc_submit_work_func(struct work_struct *work)
 		mutex_unlock(&fb_data->queue_mutex);
 		wait_for_completion(&fb_data->lut15_free);
 		mutex_lock(&fb_data->queue_mutex);
+		if (atomic_read(&fb_data->epdc_recovery_state) &&
+		    !fb_data->recovery_refresh_active) {
+			epdc_recovery_abort_selected_locked(fb_data,
+							   upd_data_list);
+			mutex_unlock(&fb_data->queue_mutex);
+			return;
+		}
 
 		epdc_choose_next_lut(fb_data->rev, &upd_data_list->lut_num);
 	} else if (ret && (fb_data->rev < 20)) {
@@ -2950,11 +4730,26 @@ static void epdc_submit_work_func(struct work_struct *work)
 		}
 		udelay(fb_data->eof_sync_period);
 		mutex_lock(&fb_data->queue_mutex);
+		if (atomic_read(&fb_data->epdc_recovery_state) &&
+		    !fb_data->recovery_refresh_active) {
+			epdc_recovery_abort_selected_locked(fb_data,
+							   upd_data_list);
+			mutex_unlock(&fb_data->queue_mutex);
+			return;
+		}
 
 	}
 
 	/* LUTs are available, so we get one here */
+	if (atomic_read(&fb_data->epdc_recovery_state) &&
+	    !fb_data->recovery_refresh_active) {
+		epdc_recovery_abort_selected_locked(fb_data, upd_data_list);
+		mutex_unlock(&fb_data->queue_mutex);
+		return;
+	}
 	fb_data->cur_update = upd_data_list;
+	if (epdc_is_cleanup_desc(fb_data, upd_data_list->update_desc))
+		fb_data->cleanup_fence_lut = upd_data_list->lut_num;
 
 	/* Reset mask for LUTS that have completed during WB processing */
 	fb_data->luts_complete_wb = 0;
@@ -2967,6 +4762,14 @@ static void epdc_submit_work_func(struct work_struct *work)
 		list_for_each_entry_safe(next_marker, temp_marker,
 			&upd_data_list->update_desc->upd_marker_list, upd_list)
 			next_marker->lut_num = fb_data->cur_update->lut_num;
+		if (upd_data_list->update_desc->sleep_sequence) {
+			fb_data->sleep_lut_sequence[upd_data_list->lut_num] =
+				upd_data_list->update_desc->sleep_sequence;
+			epdc_pm_trace_sleep_lut_locked(fb_data,
+				E70Q10_PM_SLEEP_LUT_ASSIGNED,
+				upd_data_list->update_desc->sleep_sequence,
+				upd_data_list->lut_num, 0);
+		}
 
 		/* Mark LUT with order */
 		fb_data->lut_update_order[upd_data_list->lut_num] =
@@ -2999,19 +4802,27 @@ static void epdc_submit_work_func(struct work_struct *work)
 		fb_data->wv_modes_update = false;
 	}
 
-	epdc_submit_update(upd_data_list->lut_num,
+		if (upd_data_list->update_desc->collision_resubmit)
+			fb_data->collision_retry_submitted++;
+		if (upd_data_list->update_desc->deferred_retry)
+			fb_data->deferred_latest_retry_submitted++;
+		fb_data->latest_submitted_generation =
+			upd_data_list->update_desc->fb_source_generation;
+		epdc_submit_update(fb_data, upd_data_list->lut_num,
 			   upd_data_list->update_desc->upd_data.waveform_mode,
 			   upd_data_list->update_desc->upd_data.update_mode,
 			   (upd_data_list->update_desc->upd_data.flags
 				& EPDC_FLAG_TEST_COLLISION) ? true : false,
 			   false, 0);
-
 	/* Release buffer queues */
 	mutex_unlock(&fb_data->queue_mutex);
 }
 
-static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
-				   struct fb_info *info)
+static int __mxc_epdc_fb_send_single_update(
+				   struct mxcfb_update_data *upd_data,
+				   struct fb_info *info, bool serialize,
+				   void *serialize_wait_state,
+				   u32 sleep_sequence)
 {
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
@@ -3021,6 +4832,13 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 	int ret;
 	struct update_desc_list *upd_desc;
 	struct update_marker_data *marker_data, *next_marker, *temp_marker;
+	struct epdc_pending_coalesce_plan coalesce_plan;
+	bool cleanup_refresh;
+	bool recovery_update = serialize;
+	bool hw_wb_busy;
+	bool hw_luts_active;
+	bool coalesce_plan_valid;
+	(void)serialize_wait_state;
 
 	/* Has EPDC HW been initialized? */
 	if (!fb_data->hw_ready) {
@@ -3047,6 +4865,7 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 			upd_data->waveform_mode);
 		return -EINVAL;
 	}
+	cleanup_refresh = epdc_is_full_panel_gc16_cleanup(fb_data, upd_data);
 
 	mutex_lock(&fb_data->queue_mutex);
 	if ((upd_data->update_region.left + upd_data->update_region.width > fb_data->epdc_fb_var.xres) ||
@@ -3082,18 +4901,54 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 	}
 
 	mutex_lock(&fb_data->queue_mutex);
+	if (fb_data->cleanup_fence_active) {
+		mutex_unlock(&fb_data->queue_mutex);
+		return -EBUSY;
+	}
 
 	/*
 	 * If we are waiting to go into suspend, or the FB is blanked,
 	 * we do not accept new updates
 	 */
-	if ((fb_data->waiting_for_idle) ||
-		(fb_data->blank != FB_BLANK_UNBLANK)) {
+	if ((!recovery_update &&
+	     (fb_data->waiting_for_idle || fb_data->suspend_blocked ||
+	      fb_data->sleep_barrier_waiting ||
+	      atomic_read(&fb_data->epdc_recovery_state))) ||
+	    (fb_data->blank != FB_BLANK_UNBLANK)) {
 		dev_dbg(fb_data->dev, "EPDC not active."
 			"Update request abort.\n");
 		mutex_unlock(&fb_data->queue_mutex);
 		return -EPERM;
 	}
+
+	/*
+	 * QUEUE_AND_MERGE normally allows several LUTs to overlap.  A cleanup
+	 * refresh instead starts only after every older pending/active update has
+	 * completed. MXCFB_SEND_UPDATE holds hard_lock around this function, so a
+	 * second userspace submission cannot slip between this flush and enqueue.
+	 */
+	if (cleanup_refresh) {
+		mutex_unlock(&fb_data->queue_mutex);
+		ret = mxc_epdc_fb_flush_updates(fb_data);
+		mutex_lock(&fb_data->queue_mutex);
+		hw_wb_busy = fb_data->power_state == POWER_STATE_ON &&
+			epdc_is_working_buffer_busy();
+		hw_luts_active = fb_data->power_state == POWER_STATE_ON &&
+			epdc_any_luts_active(fb_data->rev);
+		/*
+		 * Do not trust updates_active alone here.  The EPDC may still have a
+		 * working-buffer transaction or a panel LUT active while the software
+		 * lists momentarily look empty.
+		 */
+		if (ret || !list_empty(&fb_data->upd_pending_list) ||
+		    !list_empty(&fb_data->upd_buf_collision_list) ||
+		    !is_free_list_full(fb_data) || fb_data->cur_update ||
+		    fb_data->updates_active || hw_wb_busy || hw_luts_active) {
+			mutex_unlock(&fb_data->queue_mutex);
+			return ret ? ret : -EBUSY;
+		}
+	}
+
 
 	if (fb_data->upd_scheme == UPDATE_SCHEME_SNAPSHOT) {
 		int count = 0;
@@ -3106,7 +4961,7 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 		 * mode update may cause an endless collision loop with
 		 * other updates.  Block here until updates are flushed.
 		 */
-		if (upd_data->update_mode == UPDATE_MODE_FULL) {
+		if (upd_data->update_mode == UPDATE_MODE_FULL && !cleanup_refresh) {
 			mutex_unlock(&fb_data->queue_mutex);
 			mxc_epdc_fb_flush_updates(fb_data);
 			mutex_lock(&fb_data->queue_mutex);
@@ -3134,6 +4989,12 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 		list_del_init(&upd_data_list->list);
 	}
 
+	if (cleanup_refresh) {
+		fb_data->cleanup_fence_active = true;
+		fb_data->cleanup_fence_lut = INVALID_LUT;
+		fb_data->cleanup_fence_marker = upd_data->update_marker;
+	}
+
 	/*
 	 * Create new update data structure, fill it with new update
 	 * data and add it to the list of pending updates
@@ -3146,15 +5007,86 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 			list_add(&upd_data_list->list,
 				&fb_data->upd_buf_free_list);
 		}
+		if (cleanup_refresh) {
+			fb_data->cleanup_fence_active = false;
+			fb_data->cleanup_fence_lut = INVALID_LUT;
+		}
 		mutex_unlock(&fb_data->queue_mutex);
 		return -EPERM;
 	}
 	/* Initialize per-update marker list */
 	INIT_LIST_HEAD(&upd_desc->upd_marker_list);
 	upd_desc->upd_data = *upd_data;
-	upd_desc->update_order = fb_data->order_cnt++;
-	list_add_tail(&upd_desc->list, &fb_data->upd_pending_list);
+	upd_desc->sleep_sequence = sleep_sequence;
+	/*
+	 * FBIOPAN_DISPLAY changes fb_offset for every SurfaceFlinger target.
+	 * Queue processing is asynchronous, so using the later global value in
+	 * epdc_process_update can read a different triple-buffer page than the
+	 * one associated with this request. Capture it under queue_mutex.
+	 */
+	upd_desc->fb_offset = fb_data->fb_offset;
+	upd_desc->fb_source_generation = fb_data->fb_source_generation;
+	upd_desc->fb_page_index = -1;
+	upd_desc->fb_page_generation_valid = false;
+	if (fb_data->page_lifetime_diag &&
+	    !(upd_desc->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER)) {
+		unsigned long page_flags;
+		int page = epdc_fb_page_index(fb_data, upd_desc->fb_offset);
 
+		if (page >= 0) {
+			spin_lock_irqsave(&fb_data->fb_page_lock, page_flags);
+			upd_desc->fb_page_index = page;
+			upd_desc->fb_page_generation =
+				fb_data->fb_page_generations[page];
+			upd_desc->fb_page_generation_valid = true;
+			spin_unlock_irqrestore(&fb_data->fb_page_lock, page_flags);
+		} else {
+			spin_lock_irqsave(&fb_data->fb_page_lock, page_flags);
+			fb_data->untracked_fb_submit++;
+			spin_unlock_irqrestore(&fb_data->fb_page_lock, page_flags);
+		}
+	}
+
+	upd_desc->update_order = fb_data->order_cnt++;
+	coalesce_plan_valid = epdc_plan_pending_coalesce_locked(fb_data,
+		upd_desc, &coalesce_plan);
+	ret = e70q10_source_snapshot_acquire_locked(fb_data, upd_desc);
+	if (ret == -EBUSY && coalesce_plan_valid &&
+	    epdc_reuse_pending_snapshot_locked(fb_data, upd_desc,
+					       &coalesce_plan))
+		ret = 0;
+	if (ret == -EBUSY) {
+		fb_data->source_snapshot_busy++;
+		if (epdc_is_ordinary_ui_update(fb_data, upd_desc, false)) {
+			fb_data->snapshot_busy_final_candidate++;
+			if (coalesce_plan_valid &&
+			    e70q10_defer_latest_update_locked(fb_data, upd_desc,
+								     &coalesce_plan)) {
+				mutex_unlock(&fb_data->queue_mutex);
+				queue_work(fb_data->epdc_submit_workqueue,
+					   &fb_data->epdc_submit_work);
+				return 0;
+			}
+			fb_data->deferred_latest_retry_dropped_error++;
+		}
+	}
+	if (ret) {
+		epdc_free_update_desc_locked(fb_data, upd_desc);
+		if (fb_data->upd_scheme == UPDATE_SCHEME_SNAPSHOT)
+			list_add_tail(&upd_data_list->list,
+				&fb_data->upd_buf_free_list);
+		if (cleanup_refresh) {
+			fb_data->cleanup_fence_active = false;
+			fb_data->cleanup_fence_lut = INVALID_LUT;
+		}
+		mutex_unlock(&fb_data->queue_mutex);
+		return ret;
+	}
+
+	if (coalesce_plan_valid)
+		epdc_apply_pending_coalesce_locked(fb_data, upd_desc,
+						   &coalesce_plan);
+	list_add_tail(&upd_desc->list, &fb_data->upd_pending_list);
 	/* If marker specified, associate it with a completion */
 	if (upd_data->update_marker != 0) {
 		/* Allocate new update marker and set it up */
@@ -3162,12 +5094,28 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 				GFP_KERNEL);
 		if (!marker_data) {
 			dev_err(fb_data->dev, "No memory for marker!\n");
+			list_del_init(&upd_desc->list);
+			epdc_free_update_desc_locked(fb_data, upd_desc);
+			if (fb_data->upd_scheme == UPDATE_SCHEME_SNAPSHOT)
+				list_add_tail(&upd_data_list->list,
+					&fb_data->upd_buf_free_list);
+			if (cleanup_refresh) {
+				fb_data->cleanup_fence_active = false;
+				fb_data->cleanup_fence_lut = INVALID_LUT;
+			}
 			mutex_unlock(&fb_data->queue_mutex);
+			queue_work(fb_data->epdc_submit_workqueue,
+				   &fb_data->epdc_submit_work);
 			return -ENOMEM;
 		}
 		list_add_tail(&marker_data->upd_list,
 			&upd_desc->upd_marker_list);
 		marker_data->update_marker = upd_data->update_marker;
+		marker_data->sleep_sequence = sleep_sequence;
+		marker_data->update_generation = upd_desc->update_order;
+		marker_data->retained_sleep = !!sleep_sequence;
+		marker_data->waiting = marker_data->retained_sleep;
+		INIT_LIST_HEAD(&marker_data->sleep_done_list);
 		if (upd_desc->upd_data.flags & EPDC_FLAG_TEST_COLLISION)
 			marker_data->lut_num = DRY_RUN_NO_LUT;
 		else
@@ -3177,6 +5125,9 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 		list_add_tail(&marker_data->full_list,
 			&fb_data->full_marker_list);
 	}
+	fb_data->latest_accepted_generation = max(
+		fb_data->latest_accepted_generation,
+		upd_desc->fb_source_generation);
 
 	if (fb_data->upd_scheme != UPDATE_SCHEME_SNAPSHOT) {
 		/* Queued update scheme processing */
@@ -3215,7 +5166,20 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 
 	ret = epdc_process_update(upd_data_list, fb_data);
 	if (ret) {
-		mutex_unlock(&fb_data->pxp_mutex);
+		mutex_lock(&fb_data->queue_mutex);
+		list_for_each_entry_safe(next_marker, temp_marker,
+				&upd_desc->upd_marker_list, upd_list) {
+			epdc_recovery_fail_marker_locked(fb_data, next_marker);
+		}
+		epdc_free_update_desc_locked(fb_data, upd_desc);
+		upd_data_list->update_desc = NULL;
+		list_add_tail(&upd_data_list->list,
+			&fb_data->upd_buf_free_list);
+		if (cleanup_refresh) {
+			fb_data->cleanup_fence_active = false;
+			fb_data->cleanup_fence_lut = INVALID_LUT;
+		}
+		mutex_unlock(&fb_data->queue_mutex);
 		return ret;
 	}
 
@@ -3261,6 +5225,8 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 
 		/* Save current update */
 		fb_data->cur_update = upd_data_list;
+		if (epdc_is_cleanup_desc(fb_data, upd_data_list->update_desc))
+			fb_data->cleanup_fence_lut = upd_data_list->lut_num;
 
 		/* Reset mask for LUTS that have completed during WB processing */
 		fb_data->luts_complete_wb = 0;
@@ -3299,8 +5265,7 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 		epdc_set_update_waveform(&fb_data->wv_modes);
 		fb_data->wv_modes_update = false;
 	}
-
-	epdc_submit_update(upd_data_list->lut_num,
+	epdc_submit_update(fb_data, upd_data_list->lut_num,
 			   upd_desc->upd_data.waveform_mode,
 			   upd_desc->upd_data.update_mode,
 			   (upd_desc->upd_data.flags
@@ -3310,16 +5275,57 @@ static int mxc_epdc_fb_send_single_update(struct mxcfb_update_data *upd_data,
 	mutex_unlock(&fb_data->queue_mutex);
 	return 0;
 }
+static int mxc_epdc_fb_send_single_update(
+		struct mxcfb_update_data *upd_data, struct fb_info *info,
+		bool serialize, u32 sleep_sequence)
+{
+	return __mxc_epdc_fb_send_single_update(upd_data, info, serialize, NULL,
+						 sleep_sequence);
+}
 
-int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
-				   struct fb_info *info)
+static int __mxc_epdc_fb_send_update(
+				   struct mxcfb_update_data *upd_data,
+				   struct fb_info *info, bool serialize)
 {
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
+	u32 sleep_sequence = 0;
+	bool tagged_sleep_update =
+		!!(upd_data->flags & EPDC_FLAG_E70Q10_SLEEP_SCREEN);
+
+	if (tagged_sleep_update) {
+		sleep_sequence = EPDC_E70Q10_SLEEP_SEQUENCE(upd_data->flags);
+		if (!sleep_sequence)
+			return -EINVAL;
+		upd_data->flags &= ~EPDC_E70Q10_SLEEP_TAG_MASK;
+		mutex_lock(&fb_data->queue_mutex);
+		if (!fb_data->sleep_barrier_powerdown_held)
+			fb_data->sleep_barrier_saved_pwrdown_delay =
+				fb_data->pwrdown_delay;
+		fb_data->sleep_barrier_powerdown_held = true;
+		fb_data->sleep_barrier_pending = true;
+		fb_data->pwrdown_delay = FB_POWERDOWN_DISABLE;
+		mutex_unlock(&fb_data->queue_mutex);
+		/* A previous zero-delay shutdown may already be queued. */
+		cancel_delayed_work_sync(&fb_data->epdc_done_work);
+		mutex_lock(&fb_data->queue_mutex);
+		epdc_sleep_marker_discard_old_locked(fb_data, sleep_sequence);
+		fb_data->last_sleep_sequence = sleep_sequence;
+		mutex_unlock(&fb_data->queue_mutex);
+	}
+	else {
+		mutex_lock(&fb_data->queue_mutex);
+		if (fb_data->sleep_barrier_powerdown_held &&
+		    !fb_data->sleep_barrier_pending)
+			epdc_sleep_barrier_restore_powerdown_locked(fb_data,
+								   false);
+		mutex_unlock(&fb_data->queue_mutex);
+	}
 
 	if (!fb_data->restrict_width) {
 		/* No width restriction, send entire update region */
-		return mxc_epdc_fb_send_single_update(upd_data, info);
+		return mxc_epdc_fb_send_single_update(upd_data, info, serialize,
+						      sleep_sequence);
 	} else {
 		int ret;
 		__u32 width, left;
@@ -3344,7 +5350,8 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 		}
 
 		if (*region_width <= max_upd_width)
-			return mxc_epdc_fb_send_single_update(upd_data,	info);
+			return mxc_epdc_fb_send_single_update(upd_data, info,
+						      serialize, sleep_sequence);
 
 		width = *region_width;
 		left = *region_left;
@@ -3354,7 +5361,9 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 		do {
 			*region_width = max_upd_width;
 			*region_left = left;
-			ret = mxc_epdc_fb_send_single_update(upd_data, info);
+			ret = mxc_epdc_fb_send_single_update(upd_data, info,
+							     serialize,
+							     sleep_sequence);
 			if (ret)
 				return ret;
 			width -= max_upd_width;
@@ -3364,19 +5373,28 @@ int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
 		*region_width = width;
 		*region_left = left;
 		upd_data->update_marker = marker;
-		return mxc_epdc_fb_send_single_update(upd_data, info);
+		return mxc_epdc_fb_send_single_update(upd_data, info, serialize,
+					      sleep_sequence);
 	}
+}
+int mxc_epdc_fb_send_update(struct mxcfb_update_data *upd_data,
+				   struct fb_info *info)
+{
+	return __mxc_epdc_fb_send_update(upd_data, info, false);
 }
 EXPORT_SYMBOL(mxc_epdc_fb_send_update);
 
-int mxc_epdc_fb_wait_update_complete(struct mxcfb_update_marker_data *marker_data,
-						struct fb_info *info)
+static int epdc_wait_update_marker_timeout(
+		struct mxcfb_update_marker_data *marker_data,
+		struct fb_info *info, unsigned long timeout, bool require_found,
+		u32 required_sequence)
 {
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
 	struct update_marker_data *next_marker;
 	struct update_marker_data *temp;
 	bool marker_found = false;
+	bool completed_marker_found = false;
 	int ret = 0;
 
 	/* 0 is an invalid update_marker value */
@@ -3395,6 +5413,11 @@ int mxc_epdc_fb_wait_update_complete(struct mxcfb_update_marker_data *marker_dat
 	list_for_each_entry_safe(next_marker, temp,
 		&fb_data->full_marker_list, full_list) {
 		if (next_marker->update_marker == marker_data->update_marker) {
+			if (required_sequence &&
+			    next_marker->sleep_sequence != required_sequence) {
+				mutex_unlock(&fb_data->queue_mutex);
+				return -ESTALE;
+			}
 			dev_dbg(fb_data->dev, "Waiting for marker %d\n",
 				marker_data->update_marker);
 			next_marker->waiting = true;
@@ -3402,18 +5425,42 @@ int mxc_epdc_fb_wait_update_complete(struct mxcfb_update_marker_data *marker_dat
 			break;
 		}
 	}
+	if (!marker_found) {
+		list_for_each_entry_safe(next_marker, temp,
+			&fb_data->sleep_marker_done_list, sleep_done_list) {
+			if (next_marker->update_marker !=
+			    marker_data->update_marker)
+				continue;
+			if (required_sequence &&
+			    next_marker->sleep_sequence != required_sequence) {
+				mutex_unlock(&fb_data->queue_mutex);
+				return -ESTALE;
+			}
+			list_del_init(&next_marker->sleep_done_list);
+			marker_data->collision_test =
+				next_marker->collision_test;
+			ret = next_marker->result;
+			completed_marker_found = true;
+			break;
+		}
+	}
 
 	mutex_unlock(&fb_data->queue_mutex);
+	if (completed_marker_found) {
+		kfree(next_marker);
+		return ret;
+	}
 
 	/*
-	 * If marker not found, it has either been signalled already
-	 * or the update request failed.  In either case, just return.
+	 * Preserve the legacy API's success-on-missing-marker behavior, but make
+	 * the sleep barrier fail closed: every tagged marker must have existed and
+	 * reached its terminal state.
 	 */
 	if (!marker_found)
-		return ret;
+		return require_found ? -ENOENT : ret;
 
 	ret = wait_for_completion_timeout(&next_marker->update_completion,
-						msecs_to_jiffies(5000));
+						timeout);
 	if (!ret) {
 		dev_err(fb_data->dev,
 			"Timed out waiting for update completion\n");
@@ -3421,21 +5468,373 @@ int mxc_epdc_fb_wait_update_complete(struct mxcfb_update_marker_data *marker_dat
 	}
 
 	marker_data->collision_test = next_marker->collision_test;
+	if (next_marker->result)
+		ret = next_marker->result;
+
+	mutex_lock(&fb_data->queue_mutex);
+	if (next_marker->retained_sleep &&
+	    !list_empty(&next_marker->sleep_done_list))
+		list_del_init(&next_marker->sleep_done_list);
+	mutex_unlock(&fb_data->queue_mutex);
 
 	/* Free update marker object */
 	kfree(next_marker);
 
 	return ret;
 }
+
+int mxc_epdc_fb_wait_update_complete(struct mxcfb_update_marker_data *marker_data,
+						struct fb_info *info)
+{
+	return epdc_wait_update_marker_timeout(marker_data, info,
+						msecs_to_jiffies(5000), false, 0);
+}
 EXPORT_SYMBOL(mxc_epdc_fb_wait_update_complete);
 
+/* queue_mutex must be held. Restore delayed panel shutdown after a completed
+ * strict barrier, or after the user explicitly returns to legacy mode.
+ */
+static void epdc_sleep_barrier_restore_powerdown_locked(
+		struct mxc_epdc_fb_data *fb_data, bool schedule_if_idle)
+{
+	int delay;
+	bool idle;
+
+	if (!fb_data->sleep_barrier_powerdown_held)
+		return;
+	delay = fb_data->sleep_barrier_saved_pwrdown_delay;
+	fb_data->sleep_barrier_powerdown_held = false;
+	fb_data->sleep_barrier_pending = false;
+	fb_data->pwrdown_delay = delay;
+	if (!schedule_if_idle || delay == FB_POWERDOWN_DISABLE ||
+	    fb_data->system_suspend_in_progress)
+		return;
+	idle = list_empty(&fb_data->upd_pending_list) &&
+		list_empty(&fb_data->upd_buf_queue) &&
+		list_empty(&fb_data->upd_buf_collision_list) &&
+		list_empty(&fb_data->full_marker_list) &&
+		!fb_data->cur_update && !fb_data->updates_active &&
+		is_free_list_full(fb_data);
+	if (!idle)
+		return;
+	mutex_lock(&fb_data->power_mutex);
+	if (fb_data->power_state == POWER_STATE_ON) {
+		fb_data->powering_down = true;
+		schedule_delayed_work(&fb_data->epdc_done_work,
+				      msecs_to_jiffies(delay));
+	}
+	mutex_unlock(&fb_data->power_mutex);
+}
+
+static void epdc_pm_trace_sleep_barrier(
+		struct mxc_epdc_fb_data *fb_data,
+		enum e70q10_pm_phase phase, u32 sequence, u32 marker,
+		int result, const u32 *pxp_regs)
+{
+	unsigned long flags;
+	struct e70q10_pm_trace_record *record;
+	u32 slot;
+
+	mutex_lock(&fb_data->queue_mutex);
+	fb_data->last_sleep_sequence = sequence;
+	epdc_pm_trace_capture_locked(fb_data, phase, true, false,
+				     result, pxp_regs);
+	mutex_unlock(&fb_data->queue_mutex);
+	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
+	if (fb_data->pm_trace_count) {
+		slot = (fb_data->pm_trace_next + E70Q10_PM_TRACE_DEPTH - 1) %
+			E70Q10_PM_TRACE_DEPTH;
+		record = &fb_data->pm_trace[slot];
+		record->sleep_sequence = sequence;
+		record->marker = marker;
+	}
+	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
+}
+
+static unsigned int epdc_sleep_snapshot_refs_locked(
+		struct mxc_epdc_fb_data *fb_data)
+{
+	unsigned int count = 0;
+	u32 i;
+
+	for (i = 0; fb_data->source_snapshots &&
+	     i < fb_data->source_snapshot_count; i++)
+		if (fb_data->source_snapshots[i].refs)
+			count++;
+	return count;
+}
+
+/* Caller holds queue_mutex. */
+static int epdc_hw_software_idle_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	unsigned int i;
+
+	if (!list_empty(&fb_data->upd_pending_list) ||
+	    !list_empty(&fb_data->upd_buf_queue) ||
+	    !list_empty(&fb_data->upd_buf_collision_list) ||
+	    !list_empty(&fb_data->full_marker_list) || fb_data->cur_update ||
+	    fb_data->updates_active || fb_data->waiting_for_idle ||
+	    fb_data->waiting_for_wb || fb_data->waiting_for_lut ||
+	    fb_data->waiting_for_lut15 || fb_data->cleanup_fence_active ||
+	    !is_free_list_full(fb_data) ||
+	    epdc_sleep_snapshot_refs_locked(fb_data) ||
+	    fb_data->deferred_latest_snapshot.refs ||
+	    fb_data->deferred_latest_desc ||
+	    work_busy(&fb_data->epdc_intr_work) ||
+	    work_busy(&fb_data->epdc_submit_work) ||
+	    fb_data->epdc_colliding_luts ||
+	    atomic_read(&fb_data->epdc_recovery_state))
+		return -EBUSY;
+	for (i = 0; i < fb_data->num_luts &&
+	     i < ARRAY_SIZE(fb_data->sleep_lut_sequence); i++)
+		if (fb_data->sleep_lut_sequence[i])
+			return -EBUSY;
+
+	return 0;
+}
+
+/* Caller holds queue_mutex -> power_mutex and EPDC clocks are live. */
+static int epdc_hw_status_idle_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	u64 lut_mask, pending_lut_irqs;
+	u32 status, irq, irq1, irq2, col, col2;
+
+	status = __raw_readl(EPDC_STATUS);
+	lut_mask = (u64)__raw_readl(EPDC_STATUS_LUTS) |
+		((u64)__raw_readl(EPDC_STATUS_LUTS2) << 32);
+	irq = __raw_readl(EPDC_IRQ);
+	irq1 = __raw_readl(EPDC_IRQ1);
+	irq2 = __raw_readl(EPDC_IRQ2);
+	col = __raw_readl(EPDC_STATUS_COL);
+	col2 = __raw_readl(EPDC_STATUS_COL2);
+	if (fb_data->rev < 20) {
+		pending_lut_irqs = irq & 0xffff;
+	} else {
+		pending_lut_irqs = (u64)irq1 | ((u64)irq2 << 32);
+		if (fb_data->num_luts < 64)
+			pending_lut_irqs &= BIT_ULL(fb_data->num_luts) - 1;
+	}
+	if ((status & EPDC_STATUS_WB_BUSY) || lut_mask || pending_lut_irqs ||
+	    (irq & (EPDC_IRQ_WB_CMPLT_IRQ | EPDC_IRQ_LUT_COL_IRQ |
+		    EPDC_IRQ_TCE_UNDERRUN_IRQ)) || col || col2)
+		return -EBUSY;
+
+	return 0;
+}
+
+/* Caller holds queue_mutex -> power_mutex. */
+static int epdc_hw_idle_locked(struct mxc_epdc_fb_data *fb_data,
+			       bool allow_powering_down)
+{
+	int ret;
+
+	if (fb_data->powering_down && !allow_powering_down)
+		return -EBUSY;
+	ret = epdc_hw_software_idle_locked(fb_data);
+	if (ret)
+		return ret;
+	if (fb_data->power_state == POWER_STATE_OFF &&
+	    !fb_data->epdc_clocks_enabled && !fb_data->powering_down)
+		return 0;
+	if (fb_data->power_state != POWER_STATE_ON ||
+	    !fb_data->epdc_clocks_enabled)
+		return -EHOSTDOWN;
+
+	return epdc_hw_status_idle_locked(fb_data);
+}
+
+static int epdc_sleep_barrier_pxp_snapshot(
+		struct mxc_epdc_fb_data *fb_data, u32 regs[PXP_PM_TRACE_REGS])
+{
+	struct dma_chan *chan;
+	bool borrowed = false;
+	int ret;
+
+	if (!mutex_trylock(&fb_data->pxp_mutex))
+		return -EBUSY;
+	chan = fb_data->pxp_chan ? &fb_data->pxp_chan->dma_chan : NULL;
+	if (!chan) {
+		chan = epdc_request_pxp_pm_channel();
+		borrowed = !!chan;
+	}
+	if (!chan) {
+		ret = -ENODEV;
+	} else {
+		ret = pxp_pm_snapshot(chan, regs);
+		if (borrowed)
+			dma_release_channel(chan);
+	}
+	mutex_unlock(&fb_data->pxp_mutex);
+	return ret;
+}
+
+static int epdc_wait_for_hw_idle(struct mxc_epdc_fb_data *fb_data,
+				 bool allow_powering_down,
+				 unsigned int timeout_ms,
+				 u32 *pxp_regs)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(timeout_ms);
+	int ret;
+
+	for (;;) {
+		unsigned long event, remaining;
+		u32 local_pxp_regs[PXP_PM_TRACE_REGS];
+
+		mutex_lock(&fb_data->queue_mutex);
+		mutex_lock(&fb_data->power_mutex);
+		ret = epdc_hw_idle_locked(fb_data, allow_powering_down);
+		mutex_unlock(&fb_data->power_mutex);
+		mutex_unlock(&fb_data->queue_mutex);
+		if (!ret) {
+			ret = epdc_sleep_barrier_pxp_snapshot(fb_data,
+							     local_pxp_regs);
+			if (!ret) {
+				/* Re-read EPDC after PxP reports idle. */
+				mutex_lock(&fb_data->queue_mutex);
+				mutex_lock(&fb_data->power_mutex);
+				ret = epdc_hw_idle_locked(fb_data,
+							  allow_powering_down);
+				mutex_unlock(&fb_data->power_mutex);
+				mutex_unlock(&fb_data->queue_mutex);
+				if (!ret) {
+					if (pxp_regs)
+						memcpy(pxp_regs, local_pxp_regs,
+						       sizeof(local_pxp_regs));
+				return 0;
+				}
+			}
+		}
+
+		if (ret != -EBUSY)
+			return ret;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+
+		event = atomic_read(&fb_data->sleep_barrier_event);
+		remaining = deadline - jiffies;
+		wait_event_timeout(fb_data->sleep_barrier_waitq,
+			atomic_read(&fb_data->sleep_barrier_event) != event,
+			min_t(unsigned long, remaining,
+			      max_t(unsigned long, 1,
+				    msecs_to_jiffies(10))));
+	}
+}
+
+static int epdc_e70q10_wait_sleep_barrier(
+		struct mxc_epdc_fb_data *fb_data,
+		const struct mxcfb_e70q10_sleep_barrier *barrier)
+{
+	unsigned long deadline;
+	u32 pxp_regs[PXP_PM_TRACE_REGS];
+	u32 marker = barrier->marker_count ? barrier->markers[0] : 0;
+	unsigned int i, j;
+	int ret = 0;
+
+	if (!barrier->sequence ||
+	    barrier->marker_count > MXCFB_E70Q10_MAX_SLEEP_MARKERS)
+		return -EINVAL;
+	for (i = 0; i < barrier->marker_count; i++) {
+		if (!barrier->markers[i])
+			return -EINVAL;
+		for (j = 0; j < i; j++)
+			if (barrier->markers[i] == barrier->markers[j])
+				return -EINVAL;
+	}
+
+	ret = mutex_lock_interruptible(&fb_data->pm_control_mutex);
+	if (ret)
+		return -ERESTARTSYS;
+
+	ret = mutex_lock_interruptible(&hard_lock);
+	if (ret) {
+		mutex_unlock(&fb_data->pm_control_mutex);
+		return -ERESTARTSYS;
+	}
+	mutex_lock(&fb_data->queue_mutex);
+	if (!barrier->marker_count)
+		fb_data->last_sleep_sequence = barrier->sequence;
+	if (fb_data->system_suspend_in_progress ||
+	    fb_data->blank != FB_BLANK_UNBLANK ||
+	    fb_data->last_sleep_sequence != barrier->sequence) {
+		ret = -EBUSY;
+		mutex_unlock(&fb_data->queue_mutex);
+		goto out_barrier;
+	}
+	fb_data->sleep_barrier_waiting = true;
+	mutex_unlock(&fb_data->queue_mutex);
+	deadline = jiffies + msecs_to_jiffies(E70Q10_SLEEP_BARRIER_TIMEOUT_MS);
+
+	for (i = 0; i < barrier->marker_count; i++) {
+		struct mxcfb_update_marker_data marker_data;
+		unsigned long remaining;
+
+		if (time_after_eq(jiffies, deadline)) {
+			ret = -ETIMEDOUT;
+			goto out_barrier;
+		}
+		remaining = deadline - jiffies;
+		marker_data.update_marker = barrier->markers[i];
+		marker_data.collision_test = 0;
+		ret = epdc_wait_update_marker_timeout(&marker_data, &fb_data->info,
+						     remaining, true,
+						     barrier->sequence);
+		if (ret)
+			goto out_barrier;
+	}
+	mutex_lock(&fb_data->queue_mutex);
+	{
+		struct update_marker_data *done_marker;
+
+		list_for_each_entry(done_marker,
+				    &fb_data->sleep_marker_done_list,
+				    sleep_done_list) {
+			if (done_marker->sleep_sequence == barrier->sequence) {
+				ret = -ENOMSG;
+				break;
+			}
+		}
+	}
+	mutex_unlock(&fb_data->queue_mutex);
+	if (ret)
+		goto out_barrier;
+
+	if (time_after_eq(jiffies, deadline)) {
+		ret = -ETIMEDOUT;
+		goto out_barrier;
+	}
+	ret = epdc_wait_for_hw_idle(fb_data, false,
+			jiffies_to_msecs(deadline - jiffies), pxp_regs);
+	if (ret)
+		goto out_barrier;
+
+out_barrier:
+	if (!ret)
+		epdc_pm_trace_sleep_barrier(fb_data,
+			E70Q10_PM_HW_IDLE_CONFIRMED,
+			barrier->sequence, marker, 1, pxp_regs);
+	mutex_lock(&fb_data->queue_mutex);
+	fb_data->sleep_barrier_waiting = false;
+	fb_data->sleep_barrier_pending = false;
+	if (!ret)
+		epdc_sleep_barrier_restore_powerdown_locked(fb_data, true);
+	mutex_unlock(&fb_data->queue_mutex);
+	mutex_unlock(&hard_lock);
+	mutex_unlock(&fb_data->pm_control_mutex);
+	return ret;
+}
+
 int mxc_epdc_fb_set_pwrdown_delay(u32 pwrdown_delay,
-					    struct fb_info *info)
+						    struct fb_info *info)
 {
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
 
-	fb_data->pwrdown_delay = pwrdown_delay;
+	mutex_lock(&fb_data->queue_mutex);
+	if (fb_data->sleep_barrier_powerdown_held)
+		fb_data->sleep_barrier_saved_pwrdown_delay = pwrdown_delay;
+	else
+		fb_data->pwrdown_delay = pwrdown_delay;
+	mutex_unlock(&fb_data->queue_mutex);
 
 	return 0;
 }
@@ -3445,14 +5844,22 @@ int mxc_epdc_get_pwrdown_delay(struct fb_info *info)
 {
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
+	int delay;
 
-	return fb_data->pwrdown_delay;
+	mutex_lock(&fb_data->queue_mutex);
+	delay = fb_data->sleep_barrier_powerdown_held ?
+		fb_data->sleep_barrier_saved_pwrdown_delay :
+		fb_data->pwrdown_delay;
+	mutex_unlock(&fb_data->queue_mutex);
+	return delay;
 }
 EXPORT_SYMBOL(mxc_epdc_get_pwrdown_delay);
 
 static int mxc_epdc_fb_ioctl(struct fb_info *info, unsigned int cmd,
 			     unsigned long arg)
 {
+	struct mxc_epdc_fb_data *fb_data = info ?
+		(struct mxc_epdc_fb_data *)info : g_fb_data;
 	void __user *argp = (void __user *)arg;
 	int ret = -EINVAL;
 
@@ -3587,6 +5994,16 @@ static int mxc_epdc_fb_ioctl(struct fb_info *info, unsigned int cmd,
 			ret = 0;
 			break;
 		}
+	case MXCFB_E70Q10_WAIT_SLEEP_BARRIER:
+		{
+			struct mxcfb_e70q10_sleep_barrier barrier;
+			if (copy_from_user(&barrier, argp, sizeof(barrier)))
+				ret = -EFAULT;
+			else
+				ret = epdc_e70q10_wait_sleep_barrier(fb_data,
+								     &barrier);
+			break;
+		}
 
 	default:
 		break;
@@ -3645,12 +6062,12 @@ static void mxc_epdc_fb_deferred_io(struct fb_info *info,
 }
 #endif
 
-void mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
+static int mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
 {
 	int ret;
 
 	if (fb_data->in_init)
-		return;
+		return 0;
 
 	/* Grab queue lock to prevent any new updates from being submitted */
 	mutex_lock(&fb_data->queue_mutex);
@@ -3673,67 +6090,168 @@ void mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
 		/* Wait for any currently active updates to complete */
 		ret = wait_for_completion_timeout(&fb_data->updates_done,
 						msecs_to_jiffies(8000));
-		if (!ret)
+		if (!ret) {
 			dev_err(fb_data->dev,
 				"Flush updates timeout! ret = 0x%x\n", ret);
+			mutex_lock(&fb_data->queue_mutex);
+			fb_data->waiting_for_idle = false;
+			mutex_unlock(&fb_data->queue_mutex);
+			epdc_recovery_dump(fb_data, "flush-timeout");
+			return -ETIMEDOUT;
+		}
 
 		mutex_lock(&fb_data->queue_mutex);
 		fb_data->waiting_for_idle = false;
 	}
 
 	mutex_unlock(&fb_data->queue_mutex);
+	return 0;
 }
+
+#ifdef CONFIG_DEBUG_FS
+static int e70q10_pm_trace_show(struct seq_file *seq, void *unused)
+{
+	struct mxc_epdc_fb_data *fb_data = seq->private;
+	struct e70q10_pm_trace_record *records;
+	unsigned long flags;
+	u32 count, start, i, j;
+
+	(void)unused;
+	records = kcalloc(E70Q10_PM_TRACE_DEPTH, sizeof(*records), GFP_KERNEL);
+	if (!records)
+		return -ENOMEM;
+	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
+	count = fb_data->pm_trace_count;
+	start = (fb_data->pm_trace_next + E70Q10_PM_TRACE_DEPTH - count) %
+		E70Q10_PM_TRACE_DEPTH;
+	for (i = 0; i < count; i++)
+		records[i] = fb_data->pm_trace[(start + i) % E70Q10_PM_TRACE_DEPTH];
+	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
+
+	for (i = 0; i < count; i++) {
+		struct e70q10_pm_trace_record *record = &records[i];
+
+		seq_printf(seq,
+			"ts_ns=%llu resume=%u phase=%s sleep_seq=%u safe=%u submit_blocked=%u powerdown_held=%u updates_active=%u cur=%u pending=%u queued=%u collision=%u markers=%u marker_done=%u free=%u snapshot_busy=%u active_luts=%016llx tce_underruns=%u panel_powerup_result=%d power=%u blank=%u rails=%u/%u/%u marker=%u lut=%u completion=%u",
+			(unsigned long long)record->timestamp_ns,
+			record->resume_sequence,
+			record->phase < ARRAY_SIZE(e70q10_pm_phase_names) ?
+				e70q10_pm_phase_names[record->phase] : "UNKNOWN",
+			record->sleep_sequence,
+			record->safe_regs, record->submit_blocked,
+			record->powerdown_held,
+			record->updates_active, record->cur_update,
+			record->pending_count, record->queued_count,
+			record->collision_count, record->marker_count,
+			record->completed_marker_count,
+			record->free_count,
+			record->snapshot_busy,
+			(unsigned long long)record->active_lut_mask,
+			record->tce_underrun_count,
+			record->panel_powerup_result,
+			record->power_state, record->blank,
+			record->display_enabled, record->vcom_enabled,
+			record->v3p3_enabled, record->marker, record->lut_num,
+			record->completion);
+		if (record->safe_regs) {
+			seq_puts(seq, " regs=");
+			for (j = 0; j < E70Q10_PM_TRACE_REGS; j++)
+				seq_printf(seq, "%s%s=%08x", j ? "," : "",
+					e70q10_pm_reg_names[j], record->regs[j]);
+		}
+		if (record->pxp_regs_valid)
+			seq_printf(seq,
+				" pxp_idle=%u pxp={CTRL:%08x,STAT:%08x,LUT_CTRL:%08x,OUT_BUF:%08x,OUT_PITCH:%08x,OUT_CTRL:%08x,OUT_AS_ULC:%08x}",
+				record->pxp_idle,
+				record->pxp_regs[0], record->pxp_regs[1],
+				record->pxp_regs[2], record->pxp_regs[3],
+				record->pxp_regs[4], record->pxp_regs[5],
+				record->pxp_regs[6]);
+		seq_putc(seq, '\n');
+	}
+	kfree(records);
+	return 0;
+}
+
+static int e70q10_pm_trace_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, e70q10_pm_trace_show, inode->i_private);
+}
+
+static const struct file_operations e70q10_pm_trace_fops = {
+	.owner = THIS_MODULE,
+	.open = e70q10_pm_trace_open,
+	.read = seq_read,
+	.llseek = seq_lseek,
+	.release = single_release,
+};
+#endif
 
 static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 {
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
-	int ret;
+	int old_blank = fb_data->blank;
+	int pwrdown_delay;
+	unsigned long timeout;
+	int ret = 0;
+	bool powered_on;
 
 	dev_dbg(fb_data->dev, "blank = %d\n", blank);
-
-	if (fb_data->blank == blank)
+	if (old_blank == blank && blank != FB_BLANK_POWERDOWN)
 		return 0;
+	if (old_blank == blank && blank == FB_BLANK_POWERDOWN) {
+		mutex_lock(&fb_data->power_mutex);
+		powered_on = fb_data->power_state == POWER_STATE_ON;
+		mutex_unlock(&fb_data->power_mutex);
+		if (!powered_on)
+			return 0;
+	}
 
 	fb_data->blank = blank;
 
 	switch (blank) {
 	case FB_BLANK_POWERDOWN:
-		mxc_epdc_fb_flush_updates(fb_data);
-		/* Wait for powerdown */
+		ret = mxc_epdc_fb_flush_updates(fb_data);
+		if (ret)
+			break;
+
 		mutex_lock(&fb_data->power_mutex);
-		if ((fb_data->power_state == POWER_STATE_ON) &&
-			(fb_data->pwrdown_delay == FB_POWERDOWN_DISABLE)) {
-
-			/* Powerdown disabled, so we disable EPDC manually */
-			int count = 0;
-			int sleep_ms = 10;
-
-			mutex_unlock(&fb_data->power_mutex);
-
-			/* If any active updates, wait for them to complete */
-			while (fb_data->updates_active) {
-				/* Timeout after 1 sec */
-				if ((count * sleep_ms) > 1000)
-					break;
-				msleep(sleep_ms);
-				count++;
-			}
-
+		powered_on = fb_data->power_state == POWER_STATE_ON;
+		pwrdown_delay = fb_data->pwrdown_delay;
+		if (powered_on && pwrdown_delay == FB_POWERDOWN_DISABLE) {
 			fb_data->powering_down = true;
-			epdc_powerdown(fb_data);
-		} else if (fb_data->power_state != POWER_STATE_OFF) {
+			mutex_unlock(&fb_data->power_mutex);
+			ret = epdc_runtime_powerdown(fb_data);
+			break;
+		}
+		if (powered_on) {
+			fb_data->powering_down = true;
 			fb_data->wait_for_powerdown = true;
 			init_completion(&fb_data->powerdown_compl);
+			schedule_delayed_work(&fb_data->epdc_done_work,
+				msecs_to_jiffies(max_t(int, pwrdown_delay, 0)));
 			mutex_unlock(&fb_data->power_mutex);
-			ret = wait_for_completion_timeout(&fb_data->powerdown_compl,
-				msecs_to_jiffies(5000));
-			if (!ret) {
-				dev_err(fb_data->dev,
-					"No powerdown received!\n");
-				return -ETIMEDOUT;
+			timeout = msecs_to_jiffies(max_t(int,
+				7000, pwrdown_delay + 7000));
+			if (!wait_for_completion_timeout(&fb_data->powerdown_compl,
+						 timeout)) {
+				cancel_delayed_work_sync(&fb_data->epdc_done_work);
+				mutex_lock(&fb_data->power_mutex);
+				fb_data->wait_for_powerdown = false;
+				if (fb_data->power_state == POWER_STATE_ON)
+					fb_data->powering_down = false;
+				mutex_unlock(&fb_data->power_mutex);
+				ret = -ETIMEDOUT;
+				break;
 			}
-		} else
+			mutex_lock(&fb_data->power_mutex);
+			powered_on = fb_data->power_state == POWER_STATE_ON;
 			mutex_unlock(&fb_data->power_mutex);
+			if (powered_on)
+				ret = -EBUSY;
+		} else {
+			mutex_unlock(&fb_data->power_mutex);
+		}
 		break;
 	case FB_BLANK_VSYNC_SUSPEND:
 	case FB_BLANK_HSYNC_SUSPEND:
@@ -3741,7 +6259,29 @@ static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 		mxc_epdc_fb_flush_updates(fb_data);
 		break;
 	}
-	return 0;
+
+	if (ret)
+		fb_data->blank = old_blank;
+	return ret;
+}
+
+static void mxc_epdc_fb_clear_row_padding(struct mxc_epdc_fb_data *fb_data,
+					  u32 fb_offset)
+{
+	u32 y;
+	u32 bytes_per_pixel = fb_data->epdc_fb_var.bits_per_pixel / 8;
+	u32 visible_bytes = fb_data->epdc_fb_var.xres * bytes_per_pixel;
+	u32 stride = fb_data->info.fix.line_length;
+	u8 *page;
+
+	if (!of_machine_is_compatible("ridi,e70q10") || !bytes_per_pixel ||
+	    visible_bytes >= stride)
+		return;
+
+	page = (u8 *)fb_data->info.screen_base + fb_offset;
+	for (y = 0; y < fb_data->epdc_fb_var.yres; y++)
+		memset(page + y * stride + visible_bytes, 0xff,
+		       stride - visible_bytes);
 }
 
 static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
@@ -3759,10 +6299,6 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 		return -EINVAL;
 	}
 
-	if ((fb_data->epdc_fb_var.xoffset == var->xoffset) &&
-		(fb_data->epdc_fb_var.yoffset == var->yoffset))
-		return 0;	/* No change, do nothing */
-
 	y_bottom = var->yoffset;
 
 	if (!(var->vmode & FB_VMODE_YWRAP))
@@ -3775,6 +6311,20 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 
 	fb_data->fb_offset = (var->yoffset * var->xres_virtual + var->xoffset)
 		* (var->bits_per_pixel) / 8;
+	fb_data->fb_source_generation++;
+	if (fb_data->page_lifetime_diag) {
+		unsigned long page_flags;
+		int page = epdc_fb_page_index(fb_data, fb_data->fb_offset);
+
+		spin_lock_irqsave(&fb_data->fb_page_lock, page_flags);
+		if (page >= 0)
+			fb_data->fb_page_generations[page]++;
+		else
+			fb_data->untracked_fb_pan++;
+		spin_unlock_irqrestore(&fb_data->fb_page_lock, page_flags);
+	}
+	/* Apply the E70Q10 portrait stride workaround before panning. */
+	mxc_epdc_fb_clear_row_padding(fb_data, fb_data->fb_offset);
 
 	fb_data->epdc_fb_var.xoffset = var->xoffset;
 	fb_data->epdc_fb_var.yoffset = var->yoffset;
@@ -3787,6 +6337,20 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 	mutex_unlock(&fb_data->queue_mutex);
 
 	return 0;
+}
+
+/*
+ * E70Q10 does not draw a framebuffer software cursor.  Returning success
+ * prevents fbcon's soft_cursor() fallback for this machine.  Other boards
+ * return an error so fbcon keeps its existing soft_cursor() behavior.
+ */
+static int e70q10_mxc_fb_cursor(struct fb_info *info,
+				struct fb_cursor *cursor)
+{
+	if (of_machine_is_compatible("ridi,e70q10"))
+		return 0;
+
+	return -ENODEV;
 }
 
 static struct fb_ops mxc_epdc_fb_ops = {
@@ -3802,6 +6366,7 @@ static struct fb_ops mxc_epdc_fb_ops = {
 	.fb_fillrect = cfb_fillrect,
 	.fb_copyarea = cfb_copyarea,
 	.fb_imageblit = cfb_imageblit,
+	.fb_cursor = e70q10_mxc_fb_cursor,
 };
 
 #ifdef CONFIG_FB_MXC_EINK_AUTO_UPDATE_MODE
@@ -3816,7 +6381,19 @@ static void epdc_done_work_func(struct work_struct *work)
 	struct mxc_epdc_fb_data *fb_data =
 		container_of(work, struct mxc_epdc_fb_data,
 			epdc_done_work.work);
-	epdc_powerdown(fb_data);
+	bool boot_initial_powerdown;
+
+	mutex_lock(&fb_data->power_mutex);
+	boot_initial_powerdown = fb_data->boot_initial_powerdown_pending;
+	fb_data->boot_initial_powerdown_pending = false;
+	mutex_unlock(&fb_data->power_mutex);
+
+	if (boot_initial_powerdown) {
+		epdc_powerdown(fb_data);
+		return;
+	}
+
+	epdc_runtime_powerdown(fb_data);
 }
 
 static bool is_free_list_full(struct mxc_epdc_fb_data *fb_data)
@@ -3839,6 +6416,7 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 {
 	struct mxc_epdc_fb_data *fb_data = dev_id;
 	u32 ints_fired, luts1_ints_fired, luts2_ints_fired;
+
 
 	/*
 	 * If we just completed one-time panel init, bypass
@@ -3874,10 +6452,16 @@ static irqreturn_t mxc_epdc_irq_handler(int irq, void *dev_id)
 		return IRQ_HANDLED;
 
 	if (__raw_readl(EPDC_IRQ) & EPDC_IRQ_TCE_UNDERRUN_IRQ) {
-		dev_err(fb_data->dev,
-			"TCE underrun! Will continue to update panel\n");
-		/* Clear TCE underrun IRQ */
+		/* Acknowledge in hard IRQ; reset and queue repair run in work context. */
 		__raw_writel(EPDC_IRQ_TCE_UNDERRUN_IRQ, EPDC_IRQ_CLEAR);
+		atomic_inc(&fb_data->tce_underrun_count);
+		/* The manual staged experiment owns reset until it returns. */
+		epdc_request_recovery(fb_data);
+		/* Recovery owns all outstanding queue and LUT reconciliation. */
+		__raw_writel(ints_fired, EPDC_IRQ_MASK_CLEAR);
+		__raw_writel(luts1_ints_fired, EPDC_IRQ_MASK1_CLEAR);
+		__raw_writel(luts2_ints_fired, EPDC_IRQ_MASK2_CLEAR);
+		return IRQ_HANDLED;
 	}
 
 	/* Check if we are waiting on EOF to sync a new update submission */
@@ -3935,7 +6519,9 @@ static void epdc_intr_work_func(struct work_struct *work)
 	u32 epdc_luts_active, epdc_wb_busy, epdc_luts_avail, epdc_lut_cancelled;
 	u32 epdc_collision;
 	u64 epdc_irq_stat;
+	u64 collision_luts_snapshot;
 	bool epdc_waiting_on_wb;
+	bool snapshot_collision_retry = false;
 	u32 coll_coord, coll_size;
 	struct mxcfb_rect coll_region;
 
@@ -3948,17 +6534,58 @@ static void epdc_intr_work_func(struct work_struct *work)
 	epdc_lut_cancelled = epdc_is_lut_cancelled();
 	epdc_luts_avail = epdc_any_luts_available();
 	epdc_collision = epdc_is_collision();
+	collision_luts_snapshot = fb_data->epdc_colliding_luts;
 	if (fb_data->rev < 20)
 		epdc_irq_stat = __raw_readl(EPDC_IRQ);
 	else
 		epdc_irq_stat = (u64)__raw_readl(EPDC_IRQ1) |
 			((u64)__raw_readl(EPDC_IRQ2) << 32);
 	epdc_waiting_on_wb = (fb_data->cur_update != NULL) ? true : false;
+	/*
+	 * Preserve collision ordering before the LUT-completion loop clears
+	 * lut_update_order[].  A collided LUT may complete in this same IRQ work
+	 * batch, or in an earlier batch while this descriptor's WB is still live.
+	 */
+	if (of_machine_is_compatible("ridi,e70q10") &&
+	    epdc_waiting_on_wb && epdc_collision &&
+	    fb_data->cur_update->update_desc) {
+		struct update_desc_list *desc =
+			fb_data->cur_update->update_desc;
+
+		fb_data->cur_update->collision_mask |= collision_luts_snapshot;
+		for (i = 0; i < fb_data->num_luts; i++) {
+			u32 collided_order;
+
+			if (!(collision_luts_snapshot & BIT_ULL(i)))
+				continue;
+			collided_order = fb_data->lut_update_order[i];
+			if (collided_order > desc->update_order &&
+			    (!desc->collided_newer_seen ||
+			     collided_order > desc->collided_newer_order)) {
+				desc->collided_newer_order = collided_order;
+				desc->collided_newer_seen = true;
+			}
+		}
+	}
 
 	/* Free any LUTs that have completed */
 	for (i = 0; i < fb_data->num_luts; i++) {
 		if ((epdc_irq_stat & (1ULL << i)) == 0)
 			continue;
+		if (fb_data->sleep_lut_sequence[i]) {
+			epdc_pm_trace_sleep_lut_locked(fb_data,
+				E70Q10_PM_SLEEP_LUT_COMPLETE,
+				fb_data->sleep_lut_sequence[i], i, 1);
+			fb_data->sleep_lut_sequence[i] = 0;
+		}
+		/* Preserve completion evidence across separate IRQ work batches. */
+		if (epdc_waiting_on_wb && fb_data->cur_update &&
+		    fb_data->cur_update->update_desc &&
+		    (fb_data->cur_update->collision_mask & BIT_ULL(i)) &&
+		    fb_data->lut_update_order[i] >
+			fb_data->cur_update->update_desc->update_order)
+			fb_data->cur_update->update_desc->
+				collided_newer_completed_before_wb = true;
 
 		dev_dbg(fb_data->dev, "LUT %d completed\n", i);
 
@@ -3973,7 +6600,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 		list_for_each_entry(collision_update,
 				    &fb_data->upd_buf_collision_list, list) {
 			collision_update->collision_mask =
-			    collision_update->collision_mask & ~(1 << i);
+			    collision_update->collision_mask & ~BIT_ULL(i);
 		}
 
 		epdc_clear_lut_complete_irq(fb_data->rev, i);
@@ -4000,6 +6627,16 @@ static void epdc_intr_work_func(struct work_struct *work)
 			(i == fb_data->cur_update->lut_num))
 			wb_lut_done = true;
 
+		if (fb_data->cleanup_fence_active &&
+		    i == fb_data->cleanup_fence_lut &&
+		    !(epdc_waiting_on_wb && epdc_collision &&
+		      epdc_is_cleanup_desc(fb_data,
+			fb_data->cur_update->update_desc) &&
+		      i == fb_data->cur_update->lut_num)) {
+			fb_data->cleanup_fence_active = false;
+			fb_data->cleanup_fence_lut = INVALID_LUT;
+		}
+
 		/* Signal completion if anyone waiting on this LUT */
 		if (!wb_lut_done)
 			list_for_each_entry_safe(next_marker, temp,
@@ -4008,16 +6645,10 @@ static void epdc_intr_work_func(struct work_struct *work)
 				if (next_marker->lut_num != i)
 					continue;
 
-				/* Found marker to signal - remove from list */
-				list_del_init(&next_marker->full_list);
-
 				/* Signal completion of update */
 				dev_dbg(fb_data->dev, "Signaling marker %d\n",
 					next_marker->update_marker);
-				if (next_marker->waiting)
-					complete(&next_marker->update_completion);
-				else
-					kfree(next_marker);
+				epdc_complete_marker_locked(fb_data, next_marker, 0);
 			}
 	}
 
@@ -4052,6 +6683,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 	if (epdc_wb_busy) {
 		/* Can't submit another update until WB is done */
 		mutex_unlock(&fb_data->queue_mutex);
+		epdc_sleep_barrier_wake(fb_data);
 		return;
 	}
 
@@ -4088,14 +6720,11 @@ static void epdc_intr_work_func(struct work_struct *work)
 					"In IRQ, collision_test = %d\n",
 					next_marker->collision_test);
 
-				/* Found marker to signal - remove from list */
-				list_del_init(&next_marker->full_list);
-
 				/* Signal completion of update */
 				dev_dbg(fb_data->dev, "Signaling marker "
 					"for dry-run - %d\n",
 					next_marker->update_marker);
-				complete(&next_marker->update_completion);
+				epdc_complete_marker_locked(fb_data, next_marker, 0);
 			}
 		} else if (epdc_lut_cancelled && !epdc_collision) {
 			/*
@@ -4103,8 +6732,19 @@ static void epdc_intr_work_func(struct work_struct *work)
 			* pixels collided. In that case we handle it as a
 			* collision, not a cancel.
 			*/
+			if (fb_data->sleep_lut_sequence[
+				fb_data->cur_update->lut_num]) {
+				u32 lut = fb_data->cur_update->lut_num;
+
+				epdc_pm_trace_sleep_lut_locked(fb_data,
+					E70Q10_PM_SLEEP_LUT_COMPLETE,
+					fb_data->sleep_lut_sequence[lut], lut, 3);
+				fb_data->sleep_lut_sequence[lut] = 0;
+			}
 
 			/* Clear LUT status (might be set if no AUTOWV used) */
+			if (fb_data->cur_update->update_desc->deferred_retry)
+				fb_data->deferred_latest_retry_dropped_error++;
 
 			/*
 			 * Disable and clear IRQ for the LUT used.
@@ -4117,6 +6757,11 @@ static void epdc_intr_work_func(struct work_struct *work)
 					fb_data->cur_update->lut_num);
 
 			fb_data->lut_update_order[fb_data->cur_update->lut_num] = 0;
+			if (epdc_is_cleanup_desc(fb_data,
+					fb_data->cur_update->update_desc)) {
+				fb_data->cleanup_fence_active = false;
+				fb_data->cleanup_fence_lut = INVALID_LUT;
+			}
 
 			/* Signal completion if submit workqueue needs a LUT */
 			if (fb_data->waiting_for_lut) {
@@ -4128,25 +6773,30 @@ static void epdc_intr_work_func(struct work_struct *work)
 				&fb_data->cur_update->update_desc->upd_marker_list,
 				upd_list) {
 
-				/* Del from per-update & full list */
-				list_del_init(&next_marker->upd_list);
-				list_del_init(&next_marker->full_list);
-
 				/* Signal completion of update */
 				dev_dbg(fb_data->dev,
 					"Signaling marker (cancelled) %d\n",
 					next_marker->update_marker);
-				if (next_marker->waiting)
-					complete(&next_marker->update_completion);
-				else
-					kfree(next_marker);
+				epdc_complete_marker_locked(fb_data, next_marker,
+							   -ECANCELED);
 			}
 		} else if (epdc_collision) {
 			/* Real update (no dry-run), collision occurred */
-
-			/* Check list of colliding LUTs, and add to our collision mask */
-			fb_data->cur_update->collision_mask =
-			    fb_data->epdc_colliding_luts;
+			bool cleanup_collision = epdc_is_cleanup_desc(fb_data,
+				fb_data->cur_update->update_desc);
+			bool ordinary_collision =
+				epdc_is_ordinary_collision_update(fb_data,
+					fb_data->cur_update->update_desc);
+			/*
+			 * A collided full cleanup may already be driving its
+			 * non-colliding pixels on the LUT assigned to this attempt.
+			 * Waiting only for the opposing LUTs resubmits the full rectangle
+			 * against its own still-active LUT and creates a livelock.  Include
+			 * this attempt's LUT in the fence before deciding it is retryable.
+			 */
+			if (cleanup_collision && fb_data->cur_update->lut_num >= 0)
+				fb_data->cur_update->collision_mask |=
+					BIT_ULL(fb_data->cur_update->lut_num);
 
 			/* Clear collisions that completed since WB began */
 			fb_data->cur_update->collision_mask &=
@@ -4154,11 +6804,10 @@ static void epdc_intr_work_func(struct work_struct *work)
 
 			dev_dbg(fb_data->dev, "Collision mask = 0x%llx\n",
 			       fb_data->epdc_colliding_luts);
-
 			/* For EPDC 2.0 and later, minimum collision bounds
 			   are provided by HW.  Recompute new bounds here. */
 			if ((fb_data->upd_scheme != UPDATE_SCHEME_SNAPSHOT)
-				&& (fb_data->rev >= 20)) {
+				&& (fb_data->rev >= 20) && !cleanup_collision) {
 				u32 xres, yres, rotate;
 				struct mxcfb_rect *cur_upd_rect =
 					&fb_data->cur_update->update_desc->upd_data.update_region;
@@ -4182,6 +6831,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 					"t = %d, w = %d, h = %d\n",
 					coll_region.left, coll_region.top,
 					coll_region.width, coll_region.height);
+
 
 				/* Convert coords back to orig orientation */
 				switch (fb_data->epdc_fb_var.rotate) {
@@ -4223,19 +6873,37 @@ static void epdc_intr_work_func(struct work_struct *work)
 			 * precedence anyways, so we don't want to
 			 * overwrite them.
 			 */
-			for (temp_mask = fb_data->cur_update->collision_mask, lut = 0;
-				temp_mask != 0;
-				lut++, temp_mask = temp_mask >> 1) {
-				if (!(temp_mask & 0x1))
-					continue;
-
-				if (fb_data->lut_update_order[lut] >=
-					fb_data->cur_update->update_desc->update_order) {
-					dev_dbg(fb_data->dev,
-						"Ignoring collision with"
-						"newer update.\n");
+			/*
+			 * A cleanup is a barrier and must survive even if an unusual
+			 * producer submits a newer LUT while it is active. Ordinary
+			 * updates retain the existing newer-update-wins behaviour.
+			 */
+			if (!cleanup_collision) {
+				if (ordinary_collision &&
+				    fb_data->cur_update->update_desc->collided_newer_seen) {
 					ignore_collision = true;
-					break;
+					fb_data->collision_retry_dropped_newer++;
+					if (fb_data->cur_update->update_desc->
+						collided_newer_completed_before_wb)
+						fb_data->collision_newer_completed_before_wb++;
+				}
+				for (temp_mask = fb_data->cur_update->collision_mask,
+				     lut = 0; temp_mask != 0;
+				     lut++, temp_mask = temp_mask >> 1) {
+					if (ignore_collision)
+						break;
+					if (!(temp_mask & 0x1))
+						continue;
+
+					if (fb_data->lut_update_order[lut] >=
+					    fb_data->cur_update->update_desc->update_order) {
+						dev_dbg(fb_data->dev,
+							"Ignoring collision with"
+							"newer update.\n");
+						ignore_collision = true;
+						fb_data->collision_retry_dropped_newer++;
+						break;
+					}
 				}
 			}
 
@@ -4253,33 +6921,45 @@ static void epdc_intr_work_func(struct work_struct *work)
 				/* Move to collision list */
 				list_add_tail(&fb_data->cur_update->list,
 					 &fb_data->upd_buf_collision_list);
+				fb_data->collision_created++;
+				{
+					u64 count = 0;
+					struct update_data_list *entry;
+
+					list_for_each_entry(entry,
+						&fb_data->upd_buf_collision_list, list)
+						count++;
+					fb_data->collision_list_peak = max(
+						fb_data->collision_list_peak, count);
+				}
 			}
 		}
 
 		/* Do we need to free the current update descriptor? */
 		if (free_update) {
+			if (!epdc_collision && !epdc_lut_cancelled &&
+			    fb_data->cur_update->update_desc->deferred_retry)
+				fb_data->deferred_latest_retry_success++;
+			if (!epdc_collision && !epdc_lut_cancelled &&
+			    fb_data->cur_update->update_desc->fb_source_generation >
+				fb_data->latest_completed_generation)
+				fb_data->latest_completed_generation =
+				fb_data->cur_update->update_desc->fb_source_generation;
 			/* Handle condition where WB & LUT are both complete */
 			if (wb_lut_done)
 				list_for_each_entry_safe(next_marker, temp,
 					&fb_data->cur_update->update_desc->upd_marker_list,
 					upd_list) {
 
-					/* Del from per-update & full list */
-					list_del_init(&next_marker->upd_list);
-					list_del_init(&next_marker->full_list);
-
 					/* Signal completion of update */
 					dev_dbg(fb_data->dev,
 						"Signaling marker (wb) %d\n",
 						next_marker->update_marker);
-					if (next_marker->waiting)
-						complete(&next_marker->update_completion);
-					else
-						kfree(next_marker);
+					epdc_complete_marker_locked(fb_data,
+						next_marker, 0);
 				}
-
 			/* Free marker list and update descriptor */
-			kfree(fb_data->cur_update->update_desc);
+			epdc_free_update_desc_locked(fb_data, fb_data->cur_update->update_desc);
 
 			/* Add to free buffer list */
 			list_add_tail(&fb_data->cur_update->list,
@@ -4331,6 +7011,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 
 		/* Release buffer queues */
 		mutex_unlock(&fb_data->queue_mutex);
+		epdc_sleep_barrier_wake(fb_data);
 
 		return;
 	}
@@ -4341,6 +7022,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 	if (!epdc_luts_avail) {
 		dev_dbg(fb_data->dev, "No luts available.\n");
 		mutex_unlock(&fb_data->queue_mutex);
+		epdc_sleep_barrier_wake(fb_data);
 		return;
 	}
 
@@ -4349,6 +7031,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 	if (epdc_next_lut_15 && fb_data->tce_prevent && (fb_data->rev < 20)) {
 		dev_dbg(fb_data->dev, "Must wait for LUT15\n");
 		mutex_unlock(&fb_data->queue_mutex);
+		epdc_sleep_barrier_wake(fb_data);
 		return;
 	}
 
@@ -4369,6 +7052,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 		 * and we will retry the update
 		 */
 		fb_data->cur_update = collision_update;
+		snapshot_collision_retry = true;
 		list_del_init(&fb_data->cur_update->list);
 		break;
 	}
@@ -4384,6 +7068,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 
 			/* No updates pending, so we are done */
 			mutex_unlock(&fb_data->queue_mutex);
+			epdc_sleep_barrier_wake(fb_data);
 			return;
 		} else {
 			dev_dbg(fb_data->dev, "Found a pending update!\n");
@@ -4398,11 +7083,25 @@ static void epdc_intr_work_func(struct work_struct *work)
 
 	/* Use LUT selected above */
 	fb_data->cur_update->lut_num = next_lut;
+	if (epdc_is_cleanup_desc(fb_data,
+			fb_data->cur_update->update_desc)) {
+		fb_data->cur_update->update_desc->collision_resubmit |=
+			snapshot_collision_retry;
+		fb_data->cleanup_fence_lut = next_lut;
+	}
 
 	/* Associate LUT with update markers */
 	list_for_each_entry_safe(next_marker, temp,
 		&fb_data->cur_update->update_desc->upd_marker_list, upd_list)
 		next_marker->lut_num = fb_data->cur_update->lut_num;
+	if (fb_data->cur_update->update_desc->sleep_sequence) {
+		fb_data->sleep_lut_sequence[fb_data->cur_update->lut_num] =
+			fb_data->cur_update->update_desc->sleep_sequence;
+		epdc_pm_trace_sleep_lut_locked(fb_data,
+			E70Q10_PM_SLEEP_LUT_ASSIGNED,
+			fb_data->cur_update->update_desc->sleep_sequence,
+			fb_data->cur_update->lut_num, 0);
+	}
 
 	/* Mark LUT as containing new update */
 	fb_data->lut_update_order[fb_data->cur_update->lut_num] =
@@ -4436,13 +7135,14 @@ static void epdc_intr_work_func(struct work_struct *work)
 		fb_data->wv_modes_update = false;
 	}
 
-	epdc_submit_update(fb_data->cur_update->lut_num,
+	epdc_submit_update(fb_data, fb_data->cur_update->lut_num,
 			   fb_data->cur_update->update_desc->upd_data.waveform_mode,
 			   fb_data->cur_update->update_desc->upd_data.update_mode,
 			   false, false, 0);
 
 	/* Release buffer queues */
 	mutex_unlock(&fb_data->queue_mutex);
+	epdc_sleep_barrier_wake(fb_data);
 
 	return;
 }
@@ -4475,7 +7175,7 @@ static void draw_mode0(struct mxc_epdc_fb_data *fb_data)
 	epdc_set_update_dimensions(xres, yres);
 	if (fb_data->rev > 20)
 		epdc_set_update_stride(0);
-	epdc_submit_update(0, fb_data->wv_modes.mode_init, UPDATE_MODE_FULL,
+		epdc_submit_update(fb_data, 0, fb_data->wv_modes.mode_init, UPDATE_MODE_FULL,
 		false, true, 0xFF);
 
 	dev_dbg(fb_data->dev, "Mode0 update - Waiting for LUT to complete...\n");
@@ -4494,7 +7194,6 @@ static void draw_mode0(struct mxc_epdc_fb_data *fb_data)
 
 	return;
 }
-
 
 static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 						     void *context)
@@ -4658,15 +7357,13 @@ static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 	fb_data->hw_ready = true;
 	fb_data->hw_initializing = false;
 
-	/* Use unrotated (native) width/height */
-	if ((screeninfo->rotate == FB_ROTATE_CW) ||
-		(screeninfo->rotate == FB_ROTATE_CCW)) {
-		xres = screeninfo->yres;
-		yres = screeninfo->xres;
-	} else {
-		xres = screeninfo->xres;
-		yres = screeninfo->yres;
-	}
+	/*
+	 * send_update() validates framebuffer-space coordinates and rotates the
+	 * rectangle later in adjust_coordinates().  Native panel dimensions here
+	 * make a rotated 1872-wide request fail against the logical 1404-wide fb.
+	 */
+	xres = screeninfo->xres;
+	yres = screeninfo->yres;
 
 	update.update_region.left = 0;
 	update.update_region.width = xres;
@@ -4680,7 +7377,12 @@ static void mxc_epdc_fb_fw_handler(const struct firmware *fw,
 
 	upd_marker_data.update_marker = update.update_marker;
 
-	mxc_epdc_fb_send_update(&update, &fb_data->info);
+	ret = mxc_epdc_fb_send_update(&update, &fb_data->info);
+	if (ret) {
+		dev_err(fb_data->dev,
+			"Initial update submit failed. Error = 0x%x\n", ret);
+		return;
+	}
 
 	/* Block on initial update */
 	ret = mxc_epdc_fb_wait_update_complete(&upd_marker_data,
@@ -4721,19 +7423,24 @@ static int mxc_epdc_fb_init_hw(struct fb_info *info)
 }
 
 static ssize_t store_update(struct device *device,
-			     struct device_attribute *attr,
-			     const char *buf, size_t count)
+			    struct device_attribute *attr,
+			    const char *buf, size_t count)
 {
 	struct mxcfb_update_data update;
 	struct fb_info *info = dev_get_drvdata(device);
 	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
+	int ret;
 
-	if (strncmp(buf, "direct", 6) == 0)
+	memset(&update, 0, sizeof(update));
+
+	if (sysfs_streq(buf, "direct"))
 		update.waveform_mode = fb_data->wv_modes.mode_du;
-	else if (strncmp(buf, "gc16", 4) == 0)
+	else if (sysfs_streq(buf, "gc16"))
 		update.waveform_mode = fb_data->wv_modes.mode_gc16;
-	else if (strncmp(buf, "gc4", 3) == 0)
+	else if (sysfs_streq(buf, "gc4"))
 		update.waveform_mode = fb_data->wv_modes.mode_gc4;
+	else
+		return -EINVAL;
 
 	/* Now, request full screen update */
 	update.update_region.left = 0;
@@ -4745,20 +7452,200 @@ static ssize_t store_update(struct device *device,
 	update.update_marker = 0;
 	update.flags = 0;
 
-	mxc_epdc_fb_send_update(&update, info);
+	ret = mxc_epdc_fb_send_update(&update, info);
+	if (ret)
+		return ret;
 
 	return count;
 }
 
+static ssize_t page_lifetime_stats_show(struct device *dev,
+					struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = dev_get_drvdata(dev);
+	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
+	unsigned long flags;
+	int len, i;
+	u64 active_lut_mask = 0;
+	u32 pending_count = 0, collision_count = 0, queued_count = 0;
+	u32 free_count = 0;
+	u32 cur_update_order = 0, cur_newer_order = 0;
+	struct update_desc_list *desc;
+	struct update_data_list *update;
+
+	(void)attr;
+	if (!fb_data->page_lifetime_diag)
+		return scnprintf(buf, PAGE_SIZE, "disabled\n");
+
+	spin_lock_irqsave(&fb_data->fb_page_lock, flags);
+	len = scnprintf(buf, PAGE_SIZE, "pages=%u", fb_data->fb_page_generation_count);
+	for (i = 0; i < fb_data->fb_page_generation_count && len < PAGE_SIZE; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len, " p%d_gen=%llu", i,
+			(unsigned long long)fb_data->fb_page_generations[i]);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		" source_reused_before_pxp=%llu source_reused_before_copybuf=%llu"
+		" untracked_pan=%llu untracked_submit=%llu",
+		(unsigned long long)fb_data->source_reused_before_pxp,
+		(unsigned long long)fb_data->source_reused_before_copybuf,
+		(unsigned long long)fb_data->untracked_fb_pan,
+		(unsigned long long)fb_data->untracked_fb_submit);
+	spin_unlock_irqrestore(&fb_data->fb_page_lock, flags);
+
+	mutex_lock(&fb_data->queue_mutex);
+	list_for_each_entry(desc, &fb_data->upd_pending_list, list)
+		pending_count++;
+	list_for_each_entry(update, &fb_data->upd_buf_collision_list, list)
+		collision_count++;
+	list_for_each_entry(update, &fb_data->upd_buf_queue, list)
+		queued_count++;
+	list_for_each_entry(update, &fb_data->upd_buf_free_list, list)
+		free_count++;
+	if (fb_data->power_state == POWER_STATE_ON)
+		active_lut_mask = epdc_any_luts_active(fb_data->rev);
+	if (fb_data->cur_update && fb_data->cur_update->update_desc) {
+		cur_update_order = fb_data->cur_update->update_desc->update_order;
+		cur_newer_order = fb_data->cur_update->update_desc->
+			collided_newer_order;
+	}
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		" snapshot_enabled=%u snapshot_slots=%u snapshot_copies=%llu"
+		" snapshot_hits=%llu snapshot_busy=%llu"
+		" collision_created=%llu collision_retry_submitted=%llu"
+		" collision_retry_dropped_newer=%llu collision_retry_zero_mask=%llu"
+		" collision_newer_completed_before_wb=%llu"
+		" collision_retry_max_depth=%llu collision_list_peak=%llu"
+		" snapshot_busy_final_candidate=%llu"
+		" deferred_latest_retry_armed=%llu"
+		" deferred_latest_retry_promoted=%llu"
+		" deferred_latest_retry_submitted=%llu"
+		" deferred_latest_retry_success=%llu"
+		" deferred_latest_retry_replaced=%llu"
+		" deferred_latest_retry_dropped_error=%llu"
+		" pending_count=%u update_buffers_in_use=%u collision_count=%u"
+		" queued_count=%u cur_update=%u cur_update_order=%u"
+		" cur_update_newer_order=%u active_lut_mask=0x%llx"
+		" deferred_latest_enabled=%u deferred_latest_pending=%u"
+		" latest_accepted_generation=%llu latest_submitted_generation=%llu"
+		" latest_terminal_desc_generation=%llu"
+		" coalesce_passes=%llu coalesce_superseded_descs=%llu"
+		" coalesce_superseded_generations=%llu"
+		" coalesce_damage_expands=%llu coalesce_full_bounds=%llu"
+		" coalesce_skipped_ineligible=%llu coalesce_marker_skips=%llu",
+		fb_data->source_snapshot_enabled ? 1 : 0,
+		fb_data->source_snapshot_count,
+		(unsigned long long)fb_data->source_snapshot_copies,
+		(unsigned long long)fb_data->source_snapshot_hits,
+		(unsigned long long)fb_data->source_snapshot_busy,
+		(unsigned long long)fb_data->collision_created,
+		(unsigned long long)fb_data->collision_retry_submitted,
+		(unsigned long long)fb_data->collision_retry_dropped_newer,
+		(unsigned long long)fb_data->collision_retry_zero_mask,
+		(unsigned long long)fb_data->collision_newer_completed_before_wb,
+		(unsigned long long)fb_data->collision_retry_max_depth,
+		(unsigned long long)fb_data->collision_list_peak,
+		(unsigned long long)fb_data->snapshot_busy_final_candidate,
+		(unsigned long long)fb_data->deferred_latest_retry_armed,
+		(unsigned long long)fb_data->deferred_latest_retry_promoted,
+		(unsigned long long)fb_data->deferred_latest_retry_submitted,
+		(unsigned long long)fb_data->deferred_latest_retry_success,
+		(unsigned long long)fb_data->deferred_latest_retry_replaced,
+		(unsigned long long)fb_data->deferred_latest_retry_dropped_error,
+		pending_count,
+		fb_data->max_num_updates - free_count,
+		collision_count,
+		queued_count,
+		fb_data->cur_update ? 1 : 0,
+		cur_update_order,
+		cur_newer_order,
+		(unsigned long long)active_lut_mask,
+		fb_data->deferred_latest_enabled ? 1 : 0,
+		fb_data->deferred_latest_desc ? 1 : 0,
+		(unsigned long long)fb_data->latest_accepted_generation,
+		(unsigned long long)fb_data->latest_submitted_generation,
+		(unsigned long long)fb_data->latest_completed_generation,
+		(unsigned long long)fb_data->coalesce_passes,
+		(unsigned long long)fb_data->coalesce_superseded_descs,
+		(unsigned long long)fb_data->coalesce_superseded_generations,
+		(unsigned long long)fb_data->coalesce_damage_expands,
+		(unsigned long long)fb_data->coalesce_full_bounds,
+		(unsigned long long)fb_data->coalesce_skipped_ineligible,
+		(unsigned long long)fb_data->coalesce_marker_skips);
+	for (i = 0; i < fb_data->source_snapshot_count && len < PAGE_SIZE; i++)
+		len += scnprintf(buf + len, PAGE_SIZE - len,
+			" s%d_refs=%u", i, fb_data->source_snapshots[i].refs);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		" deferred_latest_refs=%u",
+		fb_data->deferred_latest_snapshot.refs);
+	mutex_unlock(&fb_data->queue_mutex);
+
+	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	return len;
+}
+
 static struct device_attribute fb_attrs[] = {
-	__ATTR(update, S_IRUGO|S_IWUSR, NULL, store_update),
+	__ATTR(update, S_IWUSR, NULL, store_update),
 };
+
+static struct device_attribute fb_page_lifetime_stats_attr =
+	__ATTR(e70q10_page_lifetime_stats, S_IRUGO,
+	       page_lifetime_stats_show, NULL);
 
 static const struct of_device_id imx_epdc_dt_ids[] = {
 	{ .compatible = "fsl,imx6dl-epdc", },
 	{ /* sentinel */ }
 };
 MODULE_DEVICE_TABLE(of, imx_epdc_dt_ids);
+
+/* Restore the E70Q10 values and write order used by the shipping i.MX6SL. */
+static int epdc_apply_stock_qos(struct device *dev)
+{
+	struct device_node *qosc_node;
+	struct device_node *ccm_node;
+	void __iomem *qosc_base;
+	void __iomem *ccm_base;
+	u32 ccgr4;
+
+	qosc_node = of_parse_phandle(dev->of_node, "fsl,qosc", 0);
+	if (!qosc_node)
+		return -ENODEV;
+	qosc_base = of_iomap(qosc_node, 0);
+	of_node_put(qosc_node);
+	if (!qosc_base)
+		return -ENOMEM;
+
+	ccm_node = of_find_compatible_node(NULL, NULL, "fsl,imx6sl-ccm");
+	if (!ccm_node) {
+		iounmap(qosc_base);
+		return -ENODEV;
+	}
+	ccm_base = of_iomap(ccm_node, 0);
+	of_node_put(ccm_node);
+	if (!ccm_base) {
+		iounmap(qosc_base);
+		return -ENOMEM;
+	}
+
+	/* CCM_CCGR4 at 0x78 gates QOSC while its controls are programmed. */
+	ccgr4 = __raw_readl(ccm_base + EPDC_QOSC_CCM_CCGR4_OFFSET);
+	__raw_writel(ccgr4 | EPDC_QOSC_CCM_CCGR4_GATE_MASK,
+		     ccm_base + EPDC_QOSC_CCM_CCGR4_OFFSET);
+	__raw_writel(0, qosc_base);
+	__raw_writel(0, qosc_base + EPDC_QOSC_MASTER_ENABLE_OFFSET);
+	__raw_writel(0, qosc_base + EPDC_QOSC_EPDC_CHANNEL_OFFSET);
+	__raw_writel(0x0f020222, qosc_base +
+		     EPDC_QOSC_EPDC_CHANNEL_OFFSET + EPDC_QOSC_WR_OFFSET);
+	__raw_writel(0x0f020f22, qosc_base +
+		     EPDC_QOSC_EPDC_CHANNEL_OFFSET + EPDC_QOSC_RD_OFFSET);
+	/* Preserve the stock readback of the EPDC QoS status register. */
+	(void)__raw_readl(qosc_base + EPDC_QOSC_EPDC_CHANNEL_OFFSET +
+			  EPDC_QOSC_STATUS_OFFSET);
+	__raw_writel(ccgr4, ccm_base + EPDC_QOSC_CCM_CCGR4_OFFSET);
+
+	iounmap(ccm_base);
+	iounmap(qosc_base);
+	dev_info(dev, "restored stock EPDC QOSC WR/RD priorities\n");
+	return 0;
+}
 
 int mxc_epdc_fb_probe(struct platform_device *pdev)
 {
@@ -4769,6 +7656,7 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 	struct fb_info *info;
 	char *options, *opt;
 	char *panel_str = NULL;
+	int stats_ret;
 	char name[] = "mxcepdcfb";
 	struct fb_videomode *vmode;
 	int xres_virt, yres_virt, buf_size;
@@ -4825,6 +7713,9 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 		}
 
 	fb_data->dev = &pdev->dev;
+	fb_data->page_lifetime_diag =
+		of_machine_is_compatible("ridi,e70q10");
+	spin_lock_init(&fb_data->fb_page_lock);
 
 	if (!fb_data->default_bpp)
 		fb_data->default_bpp = 16;
@@ -4894,6 +7785,18 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 		fb_data->num_screens = NUM_SCREENS_MIN;
 
 	fb_data->map_size = buf_size * fb_data->num_screens;
+	if (fb_data->page_lifetime_diag) {
+		fb_data->fb_page_generations = devm_kcalloc(&pdev->dev,
+				fb_data->num_screens,
+				sizeof(*fb_data->fb_page_generations), GFP_KERNEL);
+		if (!fb_data->fb_page_generations) {
+			dev_warn(&pdev->dev,
+				 "page lifetime diagnostic disabled: generation allocation failed\n");
+			fb_data->page_lifetime_diag = false;
+		} else {
+			fb_data->fb_page_generation_count = fb_data->num_screens;
+		}
+	}
 	dev_dbg(&pdev->dev, "memory to allocate: %d\n", fb_data->map_size);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -4918,6 +7821,18 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 		ret = -ENOMEM;
 		goto out_cmap;
 	}
+
+	/*
+	 * An EPDC keeps displaying its previous contents until an explicit
+	 * update completes.  dma_alloc_writecombine() does not promise a useful
+	 * initial image, and an all-zero RGB565 buffer is black.  That made the
+	 * E70Q10 flash (and sometimes remain) black between the boot stages.
+	 * Start every framebuffer page as white so an early or missed update is
+	 * harmless on the E-Ink panel.
+	 */
+	if (of_machine_is_compatible("ridi,e70q10"))
+		memset(info->screen_base, 0xff, fb_data->map_size);
+
 	dev_dbg(&pdev->dev, "allocated at %p:0x%x\n", info->screen_base,
 		fb_data->phys_start);
 
@@ -4929,6 +7844,28 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 	var_info->xres_virtual = xres_virt;
 	/* Additional screens allow for panning  and buffer flipping */
 	var_info->yres_virtual = yres_virt * fb_data->num_screens;
+
+	/*
+	 * The ED078KH1 timing is wired to the EPDC as 1872x1404, but the
+	 * E70Q10 is a portrait reader.  This driver already supports a rotated
+	 * framebuffer: update regions are converted by adjust_coordinates() and
+	 * PxP rotates the source before it reaches the native EPDC working
+	 * buffer.  Expose that supported 1404x1872 mode from probe time so Android
+	 * never discovers a landscape natural display and never has to apply a
+	 * framework/HWC rotation of its own.
+	 */
+	if (of_machine_is_compatible("ridi,e70q10")) {
+		var_info->rotate = FB_ROTATE_CCW;
+		var_info->xres = vmode->yres;
+		var_info->yres = vmode->xres;
+		var_info->xres_virtual = xres_virt_rot;
+		var_info->yres_virtual = yres_virt_rot * fb_data->num_screens;
+		dev_info(&pdev->dev,
+			 "E70Q10 portrait fb %ux%u virtual %ux%u rotate=%u; native EPDC %ux%u\n",
+			 var_info->xres, var_info->yres,
+			 var_info->xres_virtual, var_info->yres_virtual,
+			 var_info->rotate, vmode->xres, vmode->yres);
+	}
 
 	var_info->pixclock = vmode->pixclock;
 	var_info->left_margin = vmode->left_margin;
@@ -5033,6 +7970,13 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	clk_prepare_enable(fb_data->epdc_clk_axi);
 	val = __raw_readl(EPDC_VERSION);
+	if (of_machine_is_compatible("ridi,e70q10")) {
+		int qos_ret = epdc_apply_stock_qos(&pdev->dev);
+
+		if (qos_ret)
+			dev_warn(&pdev->dev,
+				 "stock EPDC QoS setup unavailable: %d\n", qos_ret);
+	}
 	clk_disable_unprepare(fb_data->epdc_clk_axi);
 	fb_data->rev = ((val & EPDC_VERSION_MAJOR_MASK) >>
 				EPDC_VERSION_MAJOR_OFFSET) * 10
@@ -5073,28 +8017,117 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 		list_add(&upd_list->list, &fb_data->upd_buf_free_list);
 	}
 
+	/*
+	 * Android HWC1 releases framebuffer targets without an EPDC source fence.
+	 * Keep a small bounded pool of immutable full-frame sources for queued
+	 * E70Q10 updates. Three normal slots match the Android framebuffer page
+	 * count. A separate one-deep reserve retains the newest eligible ordinary
+	 * update when all normal slots are owned by live descriptors.
+	 */
+	if (of_machine_is_compatible("ridi,e70q10")) {
+		fb_data->source_snapshot_size =
+			fb_data->max_pix_size * fb_data->default_bpp / 8;
+		fb_data->source_snapshot_copy_size =
+			(size_t)fb_data->info.fix.line_length *
+			fb_data->info.var.yres;
+		if (!fb_data->source_snapshot_copy_size ||
+		    fb_data->source_snapshot_copy_size >
+			fb_data->source_snapshot_size) {
+			dev_err(&pdev->dev,
+				"invalid E70Q10 snapshot geometry copy=%zu alloc=%zu\n",
+				fb_data->source_snapshot_copy_size,
+				fb_data->source_snapshot_size);
+			ret = -EINVAL;
+			goto out_upd_lists;
+		}
+
+		fb_data->source_snapshots = kcalloc(
+			E70Q10_SOURCE_SNAPSHOT_SLOTS,
+			sizeof(*fb_data->source_snapshots), GFP_KERNEL);
+		if (!fb_data->source_snapshots) {
+			ret = -ENOMEM;
+			goto out_upd_lists;
+		}
+
+		for (i = 0; i < E70Q10_SOURCE_SNAPSHOT_SLOTS; i++) {
+			struct e70q10_source_snapshot *snapshot =
+				&fb_data->source_snapshots[i];
+
+			snapshot->virt_addr = dma_alloc_coherent(fb_data->dev,
+				fb_data->source_snapshot_size,
+				&snapshot->phys_addr, GFP_DMA | GFP_KERNEL);
+			if (!snapshot->virt_addr) {
+				dev_warn(&pdev->dev,
+					"E70Q10 source snapshot pool reduced to %u slots\n",
+					fb_data->source_snapshot_count);
+				break;
+			}
+			memset(snapshot->virt_addr, 0xff,
+			       fb_data->source_snapshot_size);
+			fb_data->source_snapshot_count++;
+		}
+
+		if (!fb_data->source_snapshot_count) {
+			dev_err(&pdev->dev,
+				"unable to allocate any E70Q10 source snapshot slot\n");
+			ret = -ENOMEM;
+			goto out_source_snapshots;
+		}
+		fb_data->source_snapshot_enabled = true;
+		fb_data->deferred_latest_snapshot.virt_addr =
+			dma_alloc_coherent(fb_data->dev,
+				fb_data->source_snapshot_size,
+				&fb_data->deferred_latest_snapshot.phys_addr,
+				GFP_DMA | GFP_KERNEL);
+		if (!fb_data->deferred_latest_snapshot.virt_addr) {
+			dev_warn(&pdev->dev,
+				 "E70Q10 deferred latest-state reserve unavailable; "
+				 "snapshot pressure can still return -EBUSY\n");
+		} else {
+			memset(fb_data->deferred_latest_snapshot.virt_addr,
+			       0xff, fb_data->source_snapshot_size);
+			fb_data->deferred_latest_enabled = true;
+		}
+		dev_info(&pdev->dev,
+			 "E70Q10 immutable source snapshots: slots=%u copy=%zu alloc=%zu deferred=%u\n",
+			 fb_data->source_snapshot_count,
+			 fb_data->source_snapshot_copy_size,
+			 fb_data->source_snapshot_size,
+			 fb_data->deferred_latest_enabled ? 1 : 0);
+	}
+
 	fb_data->virt_addr_updbuf =
 		kzalloc(sizeof(void *) * fb_data->max_num_buffers, GFP_KERNEL);
 	fb_data->phys_addr_updbuf =
 		kzalloc(sizeof(dma_addr_t) * fb_data->max_num_buffers,
 			GFP_KERNEL);
+	if (!fb_data->virt_addr_updbuf || !fb_data->phys_addr_updbuf) {
+		ret = -ENOMEM;
+		goto out_upd_buffers;
+	}
 	for (i = 0; i < fb_data->max_num_buffers; i++) {
 		/*
 		 * Allocate memory for PxP output buffer.
 		 * Each update buffer is 1 byte per pixel, and can
 		 * be as big as the full-screen frame buffer
 		 */
-		fb_data->virt_addr_updbuf[i] =
-			kmalloc(fb_data->max_pix_size, GFP_KERNEL);
-		fb_data->phys_addr_updbuf[i] =
-			virt_to_phys(fb_data->virt_addr_updbuf[i]);
+		/*
+		 * PxP writes this buffer and EPDC immediately consumes it.  A
+		 * kmalloc()+virt_to_phys() buffer is not a valid coherent DMA
+		 * hand-off on i.MX6SL; the Netronix reference compensates with
+		 * global inner/outer cache flushes.  Allocate it coherently instead
+		 * so neither engine can observe stale cache lines.
+		 */
+		fb_data->virt_addr_updbuf[i] = dma_alloc_coherent(fb_data->dev,
+			fb_data->max_pix_size, &fb_data->phys_addr_updbuf[i],
+			GFP_DMA | GFP_KERNEL);
 		if (fb_data->virt_addr_updbuf[i] == NULL) {
 			ret = -ENOMEM;
 			goto out_upd_buffers;
 		}
+		memset(fb_data->virt_addr_updbuf[i], 0xf0,
+		       fb_data->max_pix_size);
 
-		dev_dbg(fb_data->info.device, "allocated %d bytes @ 0x%08X\n",
-			fb_data->max_pix_size, fb_data->phys_addr_updbuf[i]);
 	}
 
 	/* Counter indicating which update buffer should be used next. */
@@ -5158,6 +8191,9 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	/* Initialize marker list */
 	INIT_LIST_HEAD(&fb_data->full_marker_list);
+	INIT_LIST_HEAD(&fb_data->sleep_marker_done_list);
+	init_waitqueue_head(&fb_data->sleep_barrier_waitq);
+	atomic_set(&fb_data->sleep_barrier_event, 0);
 
 	/* Initialize all LUTs to inactive */
 	fb_data->lut_update_order =
@@ -5174,6 +8210,7 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 					WQ_MEM_RECLAIM | WQ_HIGHPRI |
 					WQ_CPU_INTENSIVE | WQ_UNBOUND, 1);
 	INIT_WORK(&fb_data->epdc_intr_work, epdc_intr_work_func);
+	INIT_WORK(&fb_data->epdc_recovery_work, epdc_recovery_work_func);
 
 	/* Retrieve EPDC IRQ num */
 	irq = platform_get_irq(pdev, 0);
@@ -5227,14 +8264,19 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 		goto out_dma_work_buf;
 	}
 
-	if (device_create_file(info->dev, &fb_attrs[0]))
-		dev_err(&pdev->dev, "Unable to create file from fb_attrs\n");
-
 	fb_data->cur_update = NULL;
+	fb_data->cleanup_fence_lut = INVALID_LUT;
 
 	mutex_init(&fb_data->queue_mutex);
 	mutex_init(&fb_data->pxp_mutex);
 	mutex_init(&fb_data->power_mutex);
+	mutex_init(&fb_data->pm_control_mutex);
+	spin_lock_init(&fb_data->pm_trace_lock);
+	spin_lock_init(&fb_data->epdc_recovery_lock);
+	atomic_set(&fb_data->epdc_recovery_state, 0);
+	atomic_set(&fb_data->tce_underrun_count, 0);
+	init_completion(&fb_data->epdc_recovery_done);
+	complete_all(&fb_data->epdc_recovery_done);
 
 	/*
 	 * Fill out PxP config data structure based on FB info and
@@ -5333,8 +8375,10 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 	fb_data->waiting_for_lut15 = false;
 	fb_data->waiting_for_idle = false;
 	fb_data->blank = FB_BLANK_UNBLANK;
+	fb_data->last_panel_powerup_result = -ENODATA;
 	fb_data->power_state = POWER_STATE_OFF;
 	fb_data->powering_down = false;
+	fb_data->boot_initial_powerdown_pending = true;
 	fb_data->wait_for_powerdown = false;
 	fb_data->updates_active = false;
 	fb_data->pwrdown_delay = 0;
@@ -5345,6 +8389,43 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 		dev_err(&pdev->dev,
 			"register_framebuffer failed with error %d\n", ret);
 		goto out_lutmap;
+	}
+
+	/* register_framebuffer() creates info->dev (/sys/class/graphics/fbN). */
+	ret = device_create_file(info->dev, &fb_attrs[0]);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"Unable to create /sys/class/graphics/fb%d/update: %d\n",
+			info->node, ret);
+		unregister_framebuffer(info);
+		goto out_lutmap;
+	}
+	if (fb_data->page_lifetime_diag) {
+		stats_ret = device_create_file(info->dev,
+				&fb_page_lifetime_stats_attr);
+		if (stats_ret) {
+			dev_warn(&pdev->dev,
+				 "page lifetime stats unavailable: %d\n", stats_ret);
+		} else {
+			fb_data->page_lifetime_stats_created = true;
+		}
+	}
+	if (of_machine_is_compatible("ridi,e70q10")) {
+#ifdef CONFIG_DEBUG_FS
+		fb_data->pm_trace_debugfs = debugfs_create_dir("e70q10_epdc", NULL);
+		if (IS_ERR_OR_NULL(fb_data->pm_trace_debugfs)) {
+			dev_warn(&pdev->dev,
+				 "e70q10 PM trace debugfs unavailable\n");
+			fb_data->pm_trace_debugfs = NULL;
+		} else if (IS_ERR_OR_NULL(debugfs_create_file("pm_trace", 0444,
+				fb_data->pm_trace_debugfs, fb_data,
+				&e70q10_pm_trace_fops))) {
+			dev_warn(&pdev->dev,
+				 "e70q10 PM trace file unavailable\n");
+			debugfs_remove_recursive(fb_data->pm_trace_debugfs);
+			fb_data->pm_trace_debugfs = NULL;
+		}
+#endif
 	}
 
 	g_fb_data = fb_data;
@@ -5360,6 +8441,15 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	goto out;
 
+remove_fb_attrs:
+	if (fb_data->page_lifetime_stats_created) {
+		device_remove_file(info->dev, &fb_page_lifetime_stats_attr);
+		fb_data->page_lifetime_stats_created = false;
+	}
+	device_remove_file(info->dev, &fb_attrs[0]);
+	unregister_framebuffer(info);
+	platform_set_drvdata(pdev, NULL);
+
 out_lutmap:
 	kfree(fb_data->pxp_conf.proc_data.lut_map);
 out_dma_work_buf:
@@ -5370,13 +8460,35 @@ out_copybuffer:
 			      fb_data->virt_addr_copybuf,
 			      fb_data->phys_addr_copybuf);
 out_upd_buffers:
-	for (i = 0; i < fb_data->max_num_buffers; i++)
-		if (fb_data->virt_addr_updbuf[i] != NULL)
-			kfree(fb_data->virt_addr_updbuf[i]);
+	if (fb_data->virt_addr_updbuf && fb_data->phys_addr_updbuf)
+		for (i = 0; i < fb_data->max_num_buffers; i++)
+			if (fb_data->virt_addr_updbuf[i] != NULL)
+				dma_free_coherent(fb_data->dev, fb_data->max_pix_size,
+					fb_data->virt_addr_updbuf[i],
+					fb_data->phys_addr_updbuf[i]);
 	if (fb_data->virt_addr_updbuf != NULL)
 		kfree(fb_data->virt_addr_updbuf);
 	if (fb_data->phys_addr_updbuf != NULL)
 		kfree(fb_data->phys_addr_updbuf);
+out_source_snapshots:
+	if (fb_data->deferred_latest_snapshot.virt_addr) {
+		dma_free_coherent(fb_data->dev,
+			fb_data->source_snapshot_size,
+			fb_data->deferred_latest_snapshot.virt_addr,
+			fb_data->deferred_latest_snapshot.phys_addr);
+		fb_data->deferred_latest_snapshot.virt_addr = NULL;
+	}
+	if (fb_data->source_snapshots) {
+		for (i = 0; i < fb_data->source_snapshot_count; i++)
+			if (fb_data->source_snapshots[i].virt_addr)
+				dma_free_coherent(fb_data->dev,
+					fb_data->source_snapshot_size,
+					fb_data->source_snapshots[i].virt_addr,
+					fb_data->source_snapshots[i].phys_addr);
+		kfree(fb_data->source_snapshots);
+		fb_data->source_snapshots = NULL;
+		fb_data->source_snapshot_count = 0;
+	}
 out_upd_lists:
 	list_for_each_entry_safe(plist, temp_list, &fb_data->upd_buf_free_list,
 			list) {
@@ -5402,19 +8514,46 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 	int i;
 
 	mxc_epdc_fb_blank(FB_BLANK_POWERDOWN, &fb_data->info);
+	disable_irq(fb_data->epdc_irq);
+	cancel_work_sync(&fb_data->epdc_recovery_work);
+	cancel_work_sync(&fb_data->epdc_intr_work);
 
 	flush_workqueue(fb_data->epdc_submit_workqueue);
 	destroy_workqueue(fb_data->epdc_submit_workqueue);
 
+	if (fb_data->page_lifetime_stats_created)
+		device_remove_file(fb_data->info.dev,
+				  &fb_page_lifetime_stats_attr);
+#ifdef CONFIG_DEBUG_FS
+	debugfs_remove_recursive(fb_data->pm_trace_debugfs);
+#endif
+	device_remove_file(fb_data->info.dev, &fb_attrs[0]);
 	unregister_framebuffer(&fb_data->info);
 
 	for (i = 0; i < fb_data->max_num_buffers; i++)
 		if (fb_data->virt_addr_updbuf[i] != NULL)
-			kfree(fb_data->virt_addr_updbuf[i]);
+			dma_free_coherent(fb_data->dev, fb_data->max_pix_size,
+				fb_data->virt_addr_updbuf[i],
+				fb_data->phys_addr_updbuf[i]);
 	if (fb_data->virt_addr_updbuf != NULL)
 		kfree(fb_data->virt_addr_updbuf);
 	if (fb_data->phys_addr_updbuf != NULL)
 		kfree(fb_data->phys_addr_updbuf);
+
+	if (fb_data->source_snapshots) {
+		for (i = 0; i < fb_data->source_snapshot_count; i++)
+			if (fb_data->source_snapshots[i].virt_addr)
+				dma_free_coherent(fb_data->dev,
+					fb_data->source_snapshot_size,
+					fb_data->source_snapshots[i].virt_addr,
+					fb_data->source_snapshots[i].phys_addr);
+		kfree(fb_data->source_snapshots);
+	}
+	if (fb_data->deferred_latest_snapshot.virt_addr)
+		dma_free_coherent(fb_data->dev,
+			fb_data->source_snapshot_size,
+			fb_data->deferred_latest_snapshot.virt_addr,
+			fb_data->deferred_latest_snapshot.phys_addr);
 
 	dma_free_writecombine(&pdev->dev, fb_data->working_buffer_size,
 				fb_data->working_buffer_virt,
@@ -5458,26 +8597,113 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 static int mxc_epdc_fb_suspend(struct device *dev)
 {
 	struct mxc_epdc_fb_data *data = dev_get_drvdata(dev);
+	u32 pxp_regs[PXP_PM_TRACE_REGS];
+	int saved_pwrdown_delay;
 	int ret;
 
+	mutex_lock(&data->pm_control_mutex);
+	mutex_lock(&data->queue_mutex);
+	saved_pwrdown_delay = data->pwrdown_delay;
+	data->system_suspend_in_progress = true;
+	data->pm_resume_sequence++;
+	data->suspend_blocked = true;
 	data->pwrdown_delay = FB_POWERDOWN_DISABLE;
+	epdc_pm_trace_capture_locked(data, E70Q10_PM_SUSPEND_CB_ENTRY,
+		data->power_state == POWER_STATE_ON, false, 0, NULL);
+	mutex_unlock(&data->queue_mutex);
+
+	/* Stop a previously scheduled automatic shutdown before draining. */
+	cancel_delayed_work_sync(&data->epdc_done_work);
+	ret = mxc_epdc_fb_flush_updates(data);
+	epdc_pm_trace_capture(data, E70Q10_PM_FLUSH_END,
+			     data->power_state == POWER_STATE_ON, false, NULL);
+	if (ret)
+		goto abort_suspend;
+
+	/* An underrun recovery is allowed to finish its own repair, but a plain
+	 * software flush timeout must never trigger a reset while a LUT is live.
+	 */
+	if (atomic_read(&data->epdc_recovery_state)) {
+		if (!wait_for_completion_timeout(&data->epdc_recovery_done,
+					msecs_to_jiffies(20000))) {
+			ret = -ETIMEDOUT;
+			goto abort_suspend;
+		}
+		ret = data->epdc_recovery_result;
+		if (ret)
+			goto abort_suspend;
+		ret = mxc_epdc_fb_flush_updates(data);
+		if (ret)
+			goto abort_suspend;
+	}
+
+	ret = epdc_wait_for_hw_idle(data, true, 5000, pxp_regs);
+	if (ret)
+		goto abort_suspend;
+	epdc_pm_trace_capture(data, E70Q10_PM_SUSPEND_HW_IDLE_CONFIRMED,
+			     data->power_state == POWER_STATE_ON, false, pxp_regs);
+
 	ret = mxc_epdc_fb_blank(FB_BLANK_POWERDOWN, &data->info);
 	if (ret)
-		goto out;
+		goto abort_suspend;
 
-out:
+	mutex_lock(&data->queue_mutex);
+	data->pwrdown_delay = saved_pwrdown_delay;
+	mutex_unlock(&data->queue_mutex);
+	mutex_unlock(&data->pm_control_mutex);
+	return 0;
+
+abort_suspend:
+	mutex_lock(&data->queue_mutex);
+	data->pwrdown_delay = saved_pwrdown_delay;
+	data->suspend_blocked = false;
+	data->system_suspend_in_progress = false;
+	mutex_unlock(&data->queue_mutex);
+	mutex_lock(&data->power_mutex);
+	if (data->power_state == POWER_STATE_ON)
+		data->powering_down = false;
+	mutex_unlock(&data->power_mutex);
+	mutex_unlock(&data->pm_control_mutex);
 	return ret;
 }
 
 static int mxc_epdc_fb_resume(struct device *dev)
 {
 	struct mxc_epdc_fb_data *data = dev_get_drvdata(dev);
+	int ret;
 
-	mxc_epdc_fb_blank(FB_BLANK_UNBLANK, &data->info);
-	epdc_init_settings(data);
+	ret = mxc_epdc_fb_blank(FB_BLANK_UNBLANK, &data->info);
+	if (ret) {
+		epdc_recovery_dump(data, "resume-unblank-failed");
+		epdc_finish_recovery(data, ret);
+		return ret;
+	}
+	ret = epdc_init_settings_runtime(data);
+	if (ret)
+		goto resume_init_failed;
+
+	mutex_lock(&data->queue_mutex);
+	if (!list_empty(&data->upd_pending_list) ||
+	    !list_empty(&data->upd_buf_queue) ||
+	    !list_empty(&data->upd_buf_collision_list) || data->cur_update ||
+	    data->updates_active) {
+		mutex_unlock(&data->queue_mutex);
+		dev_err(data->dev,
+			"EPDC resume found undrained software update state\n");
+		epdc_finish_recovery(data, -EIO);
+		return -EIO;
+	}
 	data->updates_active = false;
+	data->suspend_blocked = false;
+	data->system_suspend_in_progress = false;
+	mutex_unlock(&data->queue_mutex);
 
 	return 0;
+
+resume_init_failed:
+	epdc_recovery_dump(data, "resume-init-failed");
+	epdc_finish_recovery(data, ret);
+	return ret;
 }
 #else
 #define mxc_epdc_fb_suspend	NULL
@@ -5553,7 +8779,12 @@ static void pxp_dma_done(void *arg)
 	struct pxp_channel *pxp_chan = to_pxp_channel(chan);
 	struct mxc_epdc_fb_data *fb_data = pxp_chan->client;
 
-	/* This call will signal wait_for_completion_timeout() in send_buffer_to_pxp */
+	/*
+	 * pxp_irq() frees the DMA descriptor immediately after this callback.
+	 * Copy histogram status while the descriptor is still alive; reading
+	 * fb_data->txd after completion is a use-after-free.
+	 */
+	fb_data->pxp_hist_status = tx_desc->hist_status;
 	complete(&fb_data->pxp_tx_cmpl);
 }
 
@@ -5584,6 +8815,7 @@ static int pxp_chan_init(struct mxc_epdc_fb_data *fb_data)
 	}
 
 	fb_data->pxp_chan = to_pxp_channel(chan);
+	fb_data->pxp_debug_chan = &fb_data->pxp_chan->dma_chan;
 	fb_data->pxp_chan->client = fb_data;
 
 	init_completion(&fb_data->pxp_tx_cmpl);
@@ -5598,7 +8830,8 @@ static int pxp_chan_init(struct mxc_epdc_fb_data *fb_data)
  */
 static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 			      u32 src_width, u32 src_height,
-			      struct mxcfb_rect *update_region)
+			      struct mxcfb_rect *update_region,
+			      struct update_desc_list *source_desc)
 {
 	dma_cookie_t cookie;
 	struct scatterlist *sg = fb_data->sg;
@@ -5609,6 +8842,7 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	struct pxp_proc_data *proc_data = &fb_data->pxp_conf.proc_data;
 	int i, ret;
 	int length;
+	bool source_page_reused = false;
 
 	dev_dbg(fb_data->dev, "Starting PxP Send Buffer\n");
 
@@ -5635,6 +8869,7 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 	 * of the PxP task when it is done.
 	 */
 	init_completion(&fb_data->pxp_tx_cmpl);
+	fb_data->pxp_hist_status = 0;
 
 	dma_chan = &fb_data->pxp_chan->dma_chan;
 
@@ -5714,14 +8949,19 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 		desc = desc->next;
 	}
 
+	/* Sample the page generation immediately before the DMA transaction. */
+	if (source_desc)
+		source_page_reused =
+			epdc_fb_page_generation_changed(fb_data, source_desc);
+
 	/* Submitting our TX starts the PxP processing task */
 	cookie = txd->tx_submit(txd);
 	if (cookie < 0) {
 		dev_err(fb_data->info.device, "Error sending FB through PxP\n");
 		return -EIO;
 	}
-
-	fb_data->txd = txd;
+	if (source_page_reused)
+		epdc_record_fb_page_reuse(fb_data, false);
 
 	/* trigger ePxP */
 	dma_async_issue_pending(dma_chan);
@@ -5731,26 +8971,30 @@ static int pxp_process_update(struct mxc_epdc_fb_data *fb_data,
 
 static int pxp_complete_update(struct mxc_epdc_fb_data *fb_data, u32 *hist_stat)
 {
-	int ret;
+	unsigned long ret;
+
 	/*
-	 * Wait for completion event, which will be set
-	 * through our TX callback function.
+	 * HZ/10 used to be a destructive timeout: the EPDC client released the
+	 * DMA channel even though PxP could still be reading its source. A late
+	 * IRQ then completed the old transaction against a recycled channel and
+	 * could satisfy the next transaction's shared completion. Treat 100 ms as
+	 * a slow-operation threshold only. Once a transaction is submitted, source
+	 * and channel ownership are retained until the real PxP callback arrives.
+	 * A genuine hardware hang therefore fails stopped instead of corrupting a
+	 * later framebuffer/source buffer.
 	 */
 	ret = wait_for_completion_timeout(&fb_data->pxp_tx_cmpl, HZ / 10);
-	if (ret <= 0) {
-		dev_info(fb_data->info.device,
-			 "PxP operation failed due to %s\n",
-			 ret < 0 ? "user interrupt" : "timeout");
-		dma_release_channel(&fb_data->pxp_chan->dma_chan);
-		fb_data->pxp_chan = NULL;
-		return ret ? : -ETIMEDOUT;
+	if (!ret) {
+		dev_warn_ratelimited(fb_data->info.device,
+			"PxP operation exceeded 100 ms; waiting for real completion\n");
+		wait_for_completion(&fb_data->pxp_tx_cmpl);
 	}
 
 	if ((fb_data->pxp_conf.proc_data.lut_transform & EPDC_FLAG_USE_CMAP) &&
 		fb_data->pxp_conf.proc_data.lut_map_updated)
 		fb_data->pxp_conf.proc_data.lut_map_updated = false;
 
-	*hist_stat = to_tx_desc(fb_data->txd)->hist_status;
+	*hist_stat = fb_data->pxp_hist_status;
 	dma_release_channel(&fb_data->pxp_chan->dma_chan);
 	fb_data->pxp_chan = NULL;
 

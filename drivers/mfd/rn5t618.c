@@ -26,9 +26,26 @@ static const struct mfd_cell rn5t618_cells[] = {
 	{ .name = "rn5t618-wdt" },
 };
 
+/*
+ * RC5T619 has the RN5T618-compatible charger and fuel gauge block.
+ * Keep the power child variant-specific so RN5T567 users do not probe
+ * registers which do not exist on that part.
+ */
+static const struct mfd_cell rc5t619_cells[] = {
+	{ .name = "rn5t618-regulator" },
+	{ .name = "rn5t618-wdt" },
+	{ .name = "rn5t618-power" },
+	{ .name = "ricoh619-rtc" },
+};
+
 static bool rn5t618_volatile_reg(struct device *dev, unsigned int reg)
 {
 	switch (reg) {
+	/* These reflect live power history / self-clearing command state. */
+	case RN5T618_PONHIS:
+	case RN5T618_POFFHIS:
+	case RN5T618_SLPCNT:
+	case RN5T618_REPCNT:
 	case RN5T618_WATCHDOGCNT:
 	case RN5T618_DCIRQ:
 	case RN5T618_ILIMDATAH ... RN5T618_AIN0DATAL:
@@ -37,6 +54,10 @@ static bool rn5t618_volatile_reg(struct device *dev, unsigned int reg)
 	case RN5T618_IR_GPF:
 	case RN5T618_MON_IOIN:
 	case RN5T618_INTMON:
+	case RN5T618_CHGSTATE:
+	case RN5T618_CHGCTRL_IRR ... RN5T618_CHGERR_MONI:
+	case 0xa0 ... 0xaf: /* RC5T619 RTC time and status registers */
+	case RN5T618_CONTROL ... RN5T618_CC_AVEREG0:
 		return true;
 	default:
 		return false;
@@ -54,34 +75,106 @@ static const struct regmap_config rn5t618_regmap_config = {
 static struct rn5t618 *rn5t618_pm_power_off;
 static struct notifier_block rn5t618_restart_handler;
 
-static void rn5t618_trigger_poweroff_sequence(bool repower)
+/* Stock RC5T619 clears RTC alarm wake and the interrupt mask before off. */
+#define RC5T619_RTC_CTRL1 0xae
+#define RC5T619_RTC_DALE BIT(6)
+
+static int rn5t618_trigger_poweroff_sequence(bool repower)
 {
-	/* disable automatic repower-on */
-	regmap_update_bits(rn5t618_pm_power_off->regmap, RN5T618_REPCNT,
-			   RN5T618_REPCNT_REPWRON,
-			   repower ? RN5T618_REPCNT_REPWRON : 0);
-	/* start power-off sequence */
-	regmap_update_bits(rn5t618_pm_power_off->regmap, RN5T618_SLPCNT,
-			   RN5T618_SLPCNT_SWPWROFF, RN5T618_SLPCNT_SWPWROFF);
+	struct rn5t618 *pmic = rn5t618_pm_power_off;
+	unsigned int value;
+	int ret;
+
+	if (!pmic)
+		return -ENODEV;
+
+	if (pmic->variant == RC5T619) {
+		/* Match stock: always send the whole register, even if the cache
+		 * already reports zero. Never issue off if REPWRON remains set.
+		 */
+		ret = regmap_write(pmic->regmap, RN5T618_REPCNT,
+				repower ? RN5T618_REPCNT_REPWRON : 0);
+		if (ret)
+			return ret;
+		ret = regmap_read(pmic->regmap, RN5T618_REPCNT, &value);
+		if (ret)
+			return ret;
+		if (!!(value & RN5T618_REPCNT_REPWRON) != repower) {
+			pr_err("rn5t618: REPCNT verification failed: %#x (repower=%d)\n",
+				value, repower);
+			return -EIO;
+		}
+		return regmap_write(pmic->regmap, RN5T618_SLPCNT,
+				RN5T618_SLPCNT_SWPWROFF);
+	}
+
+	ret = regmap_update_bits(pmic->regmap, RN5T618_REPCNT,
+				RN5T618_REPCNT_REPWRON,
+				repower ? RN5T618_REPCNT_REPWRON : 0);
+	if (ret)
+		return ret;
+	return regmap_write_bits(pmic->regmap, RN5T618_SLPCNT,
+				RN5T618_SLPCNT_SWPWROFF, RN5T618_SLPCNT_SWPWROFF);
 }
 
 static void rn5t618_power_off(void)
 {
-	rn5t618_trigger_poweroff_sequence(false);
+	int ret;
+
+	pr_emerg("rn5t618: power-off requested (repower=0)\n");
+	if (rn5t618_pm_power_off->variant != RC5T619) {
+		ret = rn5t618_trigger_poweroff_sequence(false);
+		if (ret)
+			pr_err("rn5t618: power-off failed: %d\n", ret);
+		return;
+	}
+
+	/* Like stock, never return to the reboot syscall if power remains on.
+	 * A successful command normally cuts power before the delay expires.
+	 */
+	for (;;) {
+		ret = rn5t618_trigger_poweroff_sequence(false);
+		if (ret)
+			pr_err("rn5t618: power-off transfer failed: %d\n", ret);
+		mdelay(1000);
+		pr_err("rn5t618: still powered; retrying power-off\n");
+	}
 }
 
 static int rn5t618_restart(struct notifier_block *this,
 			    unsigned long mode, void *cmd)
 {
-	rn5t618_trigger_poweroff_sequence(true);
+	int ret = rn5t618_trigger_poweroff_sequence(true);
 
-	/*
-	 * Re-power factor detection on PMIC side is not instant. 1ms
-	 * proved to be enough time until reset takes effect.
-	 */
+	if (ret)
+		pr_err("rn5t618: restart transfer failed: %d\n", ret);
+	/* Allow the lower priority SoC handler to recover if PMIC reset fails. */
 	mdelay(1);
-
 	return NOTIFY_DONE;
+}
+
+static void rn5t618_i2c_shutdown(struct i2c_client *i2c)
+{
+	struct rn5t618 *priv = i2c_get_clientdata(i2c);
+	int ret;
+
+	if (priv != rn5t618_pm_power_off || priv->variant != RC5T619 ||
+			system_state != SYSTEM_POWER_OFF)
+		return;
+
+	/* Do the stock preparation while I2C can still sleep. Preserve the
+	 * RTC time and fuel gauge; only disable the pending alarm wake path.
+	 */
+	ret = regmap_write(priv->regmap, RN5T618_REPCNT, 0);
+	if (ret)
+		dev_err(&i2c->dev, "shutdown REPCNT clear failed: %d\n", ret);
+	ret = regmap_write(priv->regmap, RN5T618_INTEN, 0);
+	if (ret)
+		dev_err(&i2c->dev, "shutdown interrupt mask failed: %d\n", ret);
+	ret = regmap_update_bits(priv->regmap, RC5T619_RTC_CTRL1,
+				RC5T619_RTC_DALE, 0);
+	if (ret)
+		dev_err(&i2c->dev, "shutdown RTC alarm disable failed: %d\n", ret);
 }
 
 static const struct of_device_id rn5t618_of_match[] = {
@@ -119,7 +212,11 @@ static int rn5t618_i2c_probe(struct i2c_client *i2c,
 		return ret;
 	}
 
-	ret = devm_mfd_add_devices(&i2c->dev, -1, rn5t618_cells,
+	if (priv->variant == RC5T619)
+		ret = devm_mfd_add_devices(&i2c->dev, -1, rc5t619_cells,
+				   ARRAY_SIZE(rc5t619_cells), NULL, 0, NULL);
+	else
+		ret = devm_mfd_add_devices(&i2c->dev, -1, rn5t618_cells,
 				   ARRAY_SIZE(rn5t618_cells), NULL, 0, NULL);
 	if (ret) {
 		dev_err(&i2c->dev, "failed to add sub-devices: %d\n", ret);
@@ -128,10 +225,12 @@ static int rn5t618_i2c_probe(struct i2c_client *i2c,
 
 	rn5t618_pm_power_off = priv;
 	if (of_device_is_system_power_controller(i2c->dev.of_node)) {
-		if (!pm_power_off)
+		if (!pm_power_off) {
 			pm_power_off = rn5t618_power_off;
-		else
+			dev_info(&i2c->dev, "registered PMIC poweroff callback\n");
+		} else {
 			dev_warn(&i2c->dev, "Poweroff callback already assigned\n");
+		}
 	}
 
 	rn5t618_restart_handler.notifier_call = rn5t618_restart;
@@ -169,6 +268,7 @@ static struct i2c_driver rn5t618_i2c_driver = {
 		.of_match_table = of_match_ptr(rn5t618_of_match),
 	},
 	.probe = rn5t618_i2c_probe,
+	.shutdown = rn5t618_i2c_shutdown,
 	.remove = rn5t618_i2c_remove,
 	.id_table = rn5t618_i2c_id,
 };

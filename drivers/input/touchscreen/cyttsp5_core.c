@@ -907,8 +907,6 @@ static int cyttsp5_hid_send_output_(struct cyttsp5_core_data *cd,
 		cmd[cmd_offset++] = HID_OUTPUT_BL_EOP;
 	}
 
-	dev_info(cd->dev, "E70Q10_TOUCH_CMD code=%02x bytes=%*ph\n",
-		hid_output->command_code, length + 2, cmd);
 	cyttsp5_pr_buf(cd->dev, cmd, length + 2, "command");
 	rc = cyttsp5_adap_write_read_specific(cd, length + 2, cmd, NULL);
 	if (rc)
@@ -4070,11 +4068,6 @@ static irqreturn_t cyttsp5_irq(int irq, void *handle)
 {
 	struct cyttsp5_core_data *cd = handle;
 	int rc;
-	static unsigned int e70q10_irq_trace_count;
-	unsigned int trace_id = e70q10_irq_trace_count++;
-	int state_before = cd->hid_cmd_state;
-	int reset_state_before = cd->hid_reset_cmd_state;
-	int level_before = gpio_get_value(cd->cpdata->irq_gpio);
 
 	//printk("%s(%d) : sleep_state=%d\n",__func__,__LINE__,cd->sleep_state);
 
@@ -4091,14 +4084,6 @@ static irqreturn_t cyttsp5_irq(int irq, void *handle)
 	}
 
 	rc = cyttsp5_read_input(cd);
-	if (trace_id < 64) {
-		u16 trace_size = get_unaligned_le16(&cd->input_buf[0]);
-
-		dev_info(cd->dev,
-			"E70Q10_TOUCH_IRQ n=%u level=%d state=%d reset_state=%d rc=%d size=%04x report=%02x\n",
-			trace_id, level_before, state_before, reset_state_before,
-			rc, trace_size, trace_size > 2 ? cd->input_buf[2] : 0);
-	}
 	if (!rc)
 		cyttsp5_parse_input(cd);
 

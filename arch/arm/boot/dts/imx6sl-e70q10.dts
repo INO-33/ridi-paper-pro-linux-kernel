@@ -37,6 +37,20 @@
 		pinctrl-names = "default";
 		pinctrl-0 = <&pinctrl_keys>;
 
+		quick {
+			/*
+			 * Stock exposes the right-side quick button as
+			 * GPIO3_IO24 ("btn TP_ON") and reports KEY_F1 (59).
+			 * Keep the kernel ABI identical; Android maps KEY_F1
+			 * to BACK in imx-keypad.kl.
+			 */
+			label = "quick";
+			gpios = <&gpio3 24 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_F1>;
+			debounce-interval = <20>;
+			wakeup-source;
+		};
+
 		page-left-up {
 			label = "page-left-up";
 			gpios = <&gpio3 26 GPIO_ACTIVE_LOW>;
@@ -87,6 +101,37 @@
 		};
 	};
 
+	/* Stock GPIO dump: green=135, red=137, blue=138. Match stock's
+	 * low-to-light / input-to-extinguish drive with open-drain GPIOs.
+	 * The LED pad state below supplies a pull-up, not a keeper: otherwise
+	 * an OFF input can retain LOW and leave the LED faintly illuminated.
+	 * Preserve the boot indication until BatteryService takes ownership.
+	 */
+	ridi-status-leds {
+		compatible = "gpio-leds";
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_status_leds>;
+
+		green {
+			label = "ridi:green";
+			gpios = <&gpio5 7 GPIO_OPEN_DRAIN>;
+			default-state = "keep";
+			retain-state-suspended;
+		};
+		red {
+			label = "ridi:red";
+			gpios = <&gpio5 9 GPIO_OPEN_DRAIN>;
+			default-state = "keep";
+			retain-state-suspended;
+		};
+		blue {
+			label = "ridi:blue";
+			gpios = <&gpio5 10 GPIO_OPEN_DRAIN>;
+			default-state = "keep";
+			retain-state-suspended;
+		};
+	};
+
 	wifi_pwrseq: wifi-pwrseq {
 		compatible = "mmc-pwrseq-simple";
 		pinctrl-names = "default";
@@ -94,11 +139,30 @@
 		reset-gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
 		post-power-on-delay-ms = <200>;
 	};
+
+	wifi_3v3: regulator-wifi-3v3 {
+		compatible = "regulator-fixed";
+		regulator-name = "wifi-3v3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+		/* Stock E70Q10 MX6SL_WIFI_3V3 is GPIO4_29, active low. */
+		gpio = <&gpio4 29 GPIO_ACTIVE_LOW>;
+		startup-delay-us = <100000>;
+	};
+};
+
+/* Stock E70Q10 configures the i.MX6SL EPDC QOSC master at probe. */
+&aips1 {
+	qosc: qosc@2094000 {
+		compatible = "fsl,imx6sl-qosc";
+		reg = <0x02094000 0x4000>;
+	};
 };
 
 &epdc {
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_epdc>;
+	fsl,qosc = <&qosc>;
 	V3P3-supply = <&tps_v3p3>;
 	VCOM-supply = <&tps_vcom>;
 	DISPLAY-supply = <&tps_display>;
@@ -135,8 +199,16 @@
 			cy,mt {
 				name = "cy,mt";
 				cy,inp_dev_name = "cyttsp5_mt";
-				/* Netronix E70Q10 stock effective INV_X | INV_Y. */
-				cy,flags = <0x30>;
+				/*
+				 * Android now exposes the panel in its natural portrait
+				 * orientation (1404x1872, rotation 0).  Stock landscape input
+				 * used INV_X | INV_Y to compensate for the sensor mounting.
+				 * Composing that correction with the framebuffer's CCW rotation
+				 * gives portrait X = raw Y, Y = 1871 - raw X.
+				 *
+				 * CY_MT_FLAG_FLIP | CY_MT_FLAG_INV_Y
+				 */
+				cy,flags = <0x28>;
 				cy,abs = <
 					0x35 0 1871 0 0
 					0x36 0 1403 0 0
@@ -154,8 +226,11 @@
 	};
 
 	frontlight@38 {
-		compatible = "ti,lm3630a"; /* Netronix table support needs-port */
+		compatible = "ti,lm3630a";
 		reg = <0x38>;
+		/* Stock E70Q10 safe full-scale current settings. */
+		ridi,current-a = /bits/ 8 <4>;
+		ridi,current-b = /bits/ 8 <7>;
 	};
 
 	epd-pmic@68 {
@@ -197,11 +272,11 @@
 	pmic@32 {
 		compatible = "ricoh,rc5t619";
 		reg = <0x32>;
+		system-power-controller;
 		pinctrl-names = "default";
 		pinctrl-0 = <&pinctrl_ricoh_irq>;
 		interrupt-parent = <&gpio5>;
 		interrupts = <11 IRQ_TYPE_LEVEL_LOW>;
-
 		regulators {
 			rc5t619_dc1: DCDC1 {
 				regulator-name = "RC5T619_DC1";
@@ -301,9 +376,16 @@
 	pinctrl-0 = <&pinctrl_hog>;
 
 	imx6sl-e70q10 {
+		pinctrl_status_leds: statusledsgrp {
+			fsl,pins = <
+				MX6SL_PAD_SD1_DAT6__GPIO5_IO07 0x1b0b1
+				MX6SL_PAD_SD1_DAT5__GPIO5_IO09 0x1b0b1
+				MX6SL_PAD_SD1_DAT7__GPIO5_IO10 0x1b0b1
+			>;
+		};
+
 		pinctrl_hog: hoggrp {
 			fsl,pins = <
-				MX6SL_PAD_KEY_COL0__GPIO3_IO24 0x17059 /* TP power */
 				/*
 				 * Netronix uses NO_PAD_CTRL here.  Preserve the
 				 * bootloader electrical setting and only select GPIO.
@@ -343,11 +425,14 @@
 		};
 
 		pinctrl_ricoh_irq: ricohirqgrp {
-			fsl,pins = <MX6SL_PAD_SD1_DAT0__GPIO5_IO11 0x1b0b0>;
+			fsl,pins = <
+				MX6SL_PAD_SD1_DAT0__GPIO5_IO11 0x1b0b0
+			>;
 		};
 
 		pinctrl_wifi_ctrl: wifictrlgrp {
 			fsl,pins = <
+				MX6SL_PAD_SD2_DAT6__GPIO4_IO29 0x17059
 				MX6SL_PAD_SD2_DAT7__GPIO5_IO00 0x17059
 				MX6SL_PAD_SD2_DAT5__GPIO4_IO31 0x1b0b0
 			>;
@@ -355,6 +440,7 @@
 
 		pinctrl_keys: keysgrp {
 			fsl,pins = <
+				MX6SL_PAD_KEY_COL0__GPIO3_IO24 0x1b0b0
 				MX6SL_PAD_KEY_COL1__GPIO3_IO26 0x1b0b0
 				MX6SL_PAD_KEY_COL3__GPIO3_IO30 0x1b0b0
 				MX6SL_PAD_KEY_COL4__GPIO4_IO00 0x1b0b0
@@ -455,8 +541,9 @@
 	status = "okay";
 };
 
+/* This board's stock poweroff uses RC5T619, not SNVS PMIC_ON_REQ. */
 &snvs_poweroff {
-	status = "okay";
+	status = "disabled";
 };
 
 &uart1 {
@@ -484,10 +571,13 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&pinctrl_usdhc3>;
 	bus-width = <4>;
+	max-frequency = <50000000>;
 	non-removable;
+	no-1-8-v;
 	keep-power-in-suspend;
 	enable-sdio-wakeup;
 	mmc-pwrseq = <&wifi_pwrseq>;
+	vmmc-supply = <&wifi_3v3>;
 	status = "okay";
 };
 

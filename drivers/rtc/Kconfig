@@ -524,6 +524,12 @@ config RTC_DRV_TPS80031
 	  along with alarm. This driver supports the RTC driver for
 	  the TPS80031 RTC module.
 
+config RTC_DRV_RICOH619
+	tristate "Ricoh RC5T619 RTC timekeeping"
+	depends on MFD_RN5T618
+	help
+	  Use the battery-backed RTC inside the RC5T619 PMIC.
+
 config RTC_DRV_RC5T583
 	tristate "RICOH 5T583 RTC driver"
 	depends on MFD_RC5T583
