@@ -3,7 +3,7 @@
 RIDI PAPER PRO(E70Q10)의 Linux 4.9 커널 소스입니다. NXP i.MX6SoloLite 커널을
 기반으로 기기 전용 디스플레이·입력·전원 장치를 지원합니다.
 
-**전체 프로젝트의 시작점:** [메인 manifest 저장소](https://github.com/INO-33/RIDI_ANDROID8_MANIFEST)
+**전체 프로젝트의 시작점:** [메인 manifest 저장소](https://github.com/INO-33/ridi-paper-pro)
 
 ## 주요 소스
 
@@ -29,7 +29,7 @@ Android 전체를 만들 때는 이 저장소만 따로 복사하기보다 메�
 ```
 
 기기 설정과 부트 이미지 생성 규칙은
-[기기 저장소](https://github.com/INO-33/RIDI_PAPER_PRO_ANDROID8_DEVICE)에 있습니다.
+[기기 저장소](https://github.com/INO-33/ridi-paper-pro-android-device)에 있습니다.
 커널과 vendor Wi-Fi 모듈은 ABI가 맞아야 합니다. 커널 단독 컴파일 절차와 일반
 Linux 설명은 기존 [`README`](README) 및 `Documentation/`도 참고하세요.
 
