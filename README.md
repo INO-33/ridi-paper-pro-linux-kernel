@@ -42,3 +42,8 @@ Linux 설명은 기존 [`README`](README) 및 `Documentation/`도 참고하세�
 
 Linux 원본의 저작권·라이선스는 [`COPYING`](COPYING)을 따릅니다.
 원래 작업 브랜치와 과거 체크포인트 이력은 유지합니다.
+
+## 개발환경과 공개 전 자산 검토
+
+처음 구성하는 개발자는 메인 저장소의 [개발환경 구축 안내](https://github.com/INO-33/ridi-paper-pro/blob/checkpoint-20261016/DEVELOPMENT.md)를 따릅니다.
+공개 전 제외·확인 대상은 [공개 자산 목록](https://github.com/INO-33/ridi-paper-pro/blob/checkpoint-20261016/PUBLIC_ASSETS.md)에 있습니다.
