@@ -8741,6 +8741,23 @@ static void mxc_epdc_fb_shutdown(struct platform_device *pdev)
 {
 	struct mxc_epdc_fb_data *fb_data = platform_get_drvdata(pdev);
 
+#ifdef CONFIG_PM_SLEEP
+	int ret;
+
+	/* The normal suspend path blocks new submissions, drains queued/LUT
+	 * updates and powers the panel down in order. Cutting VCOM directly
+	 * during the erase phase can permanently leave a white shutdown frame.
+	 */
+	ret = mxc_epdc_fb_suspend(&pdev->dev);
+	if (!ret)
+	    return;
+	dev_warn(&pdev->dev, "shutdown EPDC drain failed (%d); forcing power off\n", ret);
+	/* A failed drain must not leave userspace free to submit more frames. */
+	mutex_lock(&fb_data->queue_mutex);
+	fb_data->suspend_blocked = true;
+	mutex_unlock(&fb_data->queue_mutex);
+#endif
+
 	/* Disable power to the EPD panel */
 	if (regulator_is_enabled(fb_data->vcom_regulator))
 		regulator_disable(fb_data->vcom_regulator);

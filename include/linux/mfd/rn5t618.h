@@ -214,6 +214,8 @@
 #define RN5T618_CC_AVEREG1		0xfb
 #define RN5T618_CC_AVEREG0		0xfc
 #define RN5T618_MAX_REG			0xfc
+#define RC5T619_BANKSEL			0xff
+#define RC5T619_BANK1(reg)		(0x100 + (reg))
 
 #define RN5T618_REPCNT_REPWRON		BIT(0)
 #define RN5T618_SLPCNT_SWPWROFF		BIT(0)
@@ -249,9 +251,21 @@ enum {
 	RC5T619,
 };
 
+enum rc5t619_irq {
+	RC5T619_IRQ_CHARGER,
+	RC5T619_IRQ_VBAT_LOW,
+	RC5T619_IRQ_RTC_ALARM,
+	RC5T619_IRQ_COUNT,
+};
+
+struct rc5t619_irq_data;
+
 struct rn5t618 {
 	struct regmap *regmap;
 	long variant;
+	struct rc5t619_irq_data *irq_data;
 };
+
+int rc5t619_get_irq(struct rn5t618 *pmic, unsigned int index);
 
 #endif /* __LINUX_MFD_RN5T618_H */

@@ -913,6 +913,7 @@ config MFD_RN5T618
 	tristate "Ricoh RN5T567/RN5T618/RC5T619 PMIC"
 	depends on I2C
 	depends on OF
+	select IRQ_DOMAIN
 	select MFD_CORE
 	select REGMAP_I2C
 	help

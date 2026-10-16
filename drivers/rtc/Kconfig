@@ -525,7 +525,7 @@ config RTC_DRV_TPS80031
 	  the TPS80031 RTC module.
 
 config RTC_DRV_RICOH619
-	tristate "Ricoh RC5T619 RTC timekeeping"
+	tristate "Ricoh RC5T619 RTC timekeeping and alarm wake"
 	depends on MFD_RN5T618
 	help
 	  Use the battery-backed RTC inside the RC5T619 PMIC.

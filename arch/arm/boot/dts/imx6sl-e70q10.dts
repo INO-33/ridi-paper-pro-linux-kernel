@@ -271,6 +271,9 @@
 
 	pmic@32 {
 		compatible = "ricoh,rc5t619";
+		wakeup-source;
+		ricoh,charger-wakeup;
+		ricoh,ridi-stock-battery;
 		reg = <0x32>;
 		system-power-controller;
 		pinctrl-names = "default";

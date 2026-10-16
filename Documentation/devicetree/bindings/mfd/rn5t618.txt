@@ -13,6 +13,18 @@ Required properties:
 		"ricoh,rc5t619"
  - reg: the I2C slave address of the device
 
+Optional properties:
+ - interrupt-parent, interrupts: physical PMIC interrupt line.
+ - wakeup-source: PMIC interrupt may wake the suspended system.
+ - ricoh,charger-wakeup: E70Q10 RC5T619 opt-in to the shared PMIC IRQ
+   domain (requires interrupts). Charger, VBAT-low ADC and RTC alarm are
+   separate nested consumers. Charger debounce/quarantine only masks its
+   own group and cannot mask the low-voltage/RTC wake paths. Unused master
+   groups remain masked. Physical IRQ ownership belongs to the MFD only.
+ - ricoh,ridi-stock-battery: select the recovered E70Q10 profile/SOC logic
+   and stock 3550mV VBAT warning comparator. Requires charger-wakeup for
+   suspend low-voltage wake. This does not change PMIC hard power-cut limits.
+
 Sub-nodes:
  - regulators: the node is required if the regulator functionality is
    needed. The valid regulator names are: DCDC1, DCDC2, DCDC3, DCDC4
