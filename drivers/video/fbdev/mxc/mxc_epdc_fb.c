@@ -67,10 +67,6 @@
 #include <asm/cacheflush.h>
 #include <asm/unaligned.h>
 
-#ifdef CONFIG_DEBUG_FS
-#include <linux/debugfs.h>
-#include <linux/seq_file.h>
-#endif
 
 #include "epdc_regs.h"
 
@@ -88,8 +84,6 @@
 #define EPDC_V2_MAX_NUM_UPDATES 64
 #define EPDC_MAX_NUM_BUFFERS	2
 #define E70Q10_SOURCE_SNAPSHOT_SLOTS	3
-#define E70Q10_PM_TRACE_DEPTH		96
-#define E70Q10_PM_TRACE_REGS		37
 #define E70Q10_SLEEP_BARRIER_TIMEOUT_MS	2500
 #define INVALID_LUT		(-1)
 #define DRY_RUN_NO_LUT		100
@@ -206,50 +200,7 @@ struct e70q10_source_snapshot {
 	u32 refs;
 };
 
-enum e70q10_pm_phase {
-	E70Q10_PM_SLEEP_LUT_ASSIGNED,
-	E70Q10_PM_SLEEP_LUT_COMPLETE,
-	E70Q10_PM_HW_IDLE_CONFIRMED,
-	E70Q10_PM_SUSPEND_HW_IDLE_CONFIRMED,
-	E70Q10_PM_POWERDOWN,
-	E70Q10_PM_SUSPEND_CB_ENTRY,
-	E70Q10_PM_FLUSH_END,
-	E70Q10_PM_EPDC_CLOCK_OFF,
-};
 
-struct e70q10_pm_trace_record {
-	u64 timestamp_ns;
-	u64 active_lut_mask;
-	u32 resume_sequence;
-	u32 sleep_sequence;
-	u32 phase;
-	u32 marker;
-	u32 lut_num;
-	u32 pending_count;
-	u32 queued_count;
-	u32 collision_count;
-	u32 marker_count;
-	u32 completed_marker_count;
-	u32 free_count;
-	u32 snapshot_busy;
-	u32 completion;
-	u32 tce_underrun_count;
-	s32 panel_powerup_result;
-	u32 regs[E70Q10_PM_TRACE_REGS];
-	u32 pxp_regs[PXP_PM_TRACE_REGS];
-	u8 submit_blocked;
-	u8 updates_active;
-	u8 cur_update;
-	u8 safe_regs;
-	u8 pxp_regs_valid;
-	u8 pxp_idle;
-	u8 powerdown_held;
-	u8 power_state;
-	u8 blank;
-	u8 display_enabled;
-	u8 vcom_enabled;
-	u8 v3p3_enabled;
-};
 
 
 struct mxc_epdc_fb_data {
@@ -328,12 +279,6 @@ struct mxc_epdc_fb_data {
 	bool fw_default_load;
 	int rev;
 	u32 last_sleep_sequence;
-	u32 pm_resume_sequence;
-	u32 pm_trace_next;
-	u32 pm_trace_count;
-	spinlock_t pm_trace_lock;
-	struct e70q10_pm_trace_record pm_trace[E70Q10_PM_TRACE_DEPTH];
-	struct dentry *pm_trace_debugfs;
 	struct mutex pm_control_mutex;
 	bool system_suspend_in_progress;
 	bool sleep_barrier_waiting;
@@ -443,22 +388,7 @@ struct mxc_epdc_fb_data {
 	struct mutex pxp_mutex; /* protects access to PxP */
 };
 
-static const char * const e70q10_pm_phase_names[] = {
-	"SLEEP_LUT_ASSIGNED", "SLEEP_LUT_COMPLETE",
-	"HW_IDLE_CONFIRMED", "SUSPEND_HW_IDLE_CONFIRMED",
-	"POWERDOWN", "SUSPEND_CB_ENTRY", "FLUSH_END", "EPDC_CLOCK_OFF",
-};
 
-static const char * const e70q10_pm_reg_names[E70Q10_PM_TRACE_REGS] = {
-	"CTRL", "RES", "FORMAT", "FIFOCTRL", "WVADDR", "WB_ADDR",
-	"WB_ADDR_TCE", "TCE_CTRL", "TCE_SDCFG", "TCE_GDCFG",
-	"TCE_HSCAN1", "TCE_HSCAN2", "TCE_VSCAN", "TCE_OE",
-	"TCE_POLARITY", "TCE_TIMING1", "TCE_TIMING2", "TCE_TIMING3",
-	"IRQ_MASK", "IRQ", "IRQ_MASK1", "IRQ1", "IRQ_MASK2", "IRQ2",
-	"STATUS", "STATUS_LUTS", "STATUS_LUTS2", "STATUS_NEXTLUT",
-	"STATUS_COL", "TEMP", "AUTOWV_LUT", "UPD_ADDR", "UPD_STRIDE",
-	"UPD_CORD", "UPD_SIZE", "UPD_CTRL", "STATUS_COL2",
-};
 
 static bool chan_filter(struct dma_chan *chan, void *arg);
 
@@ -472,156 +402,7 @@ static struct dma_chan *epdc_request_pxp_pm_channel(void)
 	return dma_request_channel(mask, chan_filter, NULL);
 }
 
-static void epdc_pm_trace_capture_locked(
-	struct mxc_epdc_fb_data *fb_data, enum e70q10_pm_phase phase,
-	bool safe_regs, bool clock_access_held, int completion,
-	const u32 *pxp_regs)
-{
-	struct e70q10_pm_trace_record record;
-	struct update_data_list *buf;
-	struct update_desc_list *pending;
-	struct update_marker_data *marker;
-	unsigned long flags;
 
-	if (!of_machine_is_compatible("ridi,e70q10"))
-		return;
-	memset(&record, 0, sizeof(record));
-	record.timestamp_ns = ktime_get_ns();
-	record.completion = completion;
-	record.resume_sequence = fb_data->pm_resume_sequence;
-	record.phase = phase;
-	record.sleep_sequence = fb_data->last_sleep_sequence;
-	record.powerdown_held = fb_data->sleep_barrier_powerdown_held;
-	record.tce_underrun_count = atomic_read(&fb_data->tce_underrun_count);
-	record.panel_powerup_result = fb_data->last_panel_powerup_result;
-	record.submit_blocked = fb_data->suspend_blocked ||
-		fb_data->sleep_barrier_waiting;
-	record.updates_active = fb_data->updates_active;
-	record.cur_update = fb_data->cur_update != NULL;
-	record.power_state = fb_data->power_state;
-	record.blank = fb_data->blank;
-	record.display_enabled = fb_data->display_enabled;
-	record.vcom_enabled = fb_data->vcom_enabled;
-	record.v3p3_enabled = fb_data->v3p3_enabled;
-	record.safe_regs = safe_regs;
-	if (fb_data->source_snapshots) {
-		u32 slot;
-
-		for (slot = 0; slot < fb_data->source_snapshot_count; slot++)
-			if (fb_data->source_snapshots[slot].refs)
-				record.snapshot_busy++;
-	}
-
-	list_for_each_entry(pending, &fb_data->upd_pending_list, list)
-		record.pending_count++;
-	list_for_each_entry(buf, &fb_data->upd_buf_queue, list)
-		record.queued_count++;
-	list_for_each_entry(buf, &fb_data->upd_buf_collision_list, list)
-		record.collision_count++;
-	list_for_each_entry(marker, &fb_data->full_marker_list, full_list)
-		record.marker_count++;
-	list_for_each_entry(marker, &fb_data->sleep_marker_done_list,
-			    sleep_done_list)
-		record.completed_marker_count++;
-	list_for_each_entry(buf, &fb_data->upd_buf_free_list, list)
-		record.free_count++;
-
-	if (safe_regs) {
-		bool regs_accessible;
-
-		/* queue_mutex -> power_mutex matches the submit worker's lock order.
-		 * clock_access_held is used only by callers already holding a clock
-		 * lease (or power_mutex), so no second power_mutex acquisition is needed.
-		 */
-		if (!clock_access_held)
-			mutex_lock(&fb_data->power_mutex);
-		regs_accessible = clock_access_held ||
-			(fb_data->power_state == POWER_STATE_ON &&
-			 fb_data->epdc_clocks_enabled);
-		if (regs_accessible) {
-		record.regs[0] = __raw_readl(EPDC_CTRL);
-		record.regs[1] = __raw_readl(EPDC_RES);
-		record.regs[2] = __raw_readl(EPDC_FORMAT);
-		record.regs[3] = __raw_readl(EPDC_FIFOCTRL);
-		record.regs[4] = __raw_readl(EPDC_WVADDR);
-		record.regs[5] = __raw_readl(EPDC_WB_ADDR);
-		record.regs[6] = __raw_readl(EPDC_WB_ADDR_TCE);
-		record.regs[7] = __raw_readl(EPDC_TCE_CTRL);
-		record.regs[8] = __raw_readl(EPDC_TCE_SDCFG);
-		record.regs[9] = __raw_readl(EPDC_TCE_GDCFG);
-		record.regs[10] = __raw_readl(EPDC_TCE_HSCAN1);
-		record.regs[11] = __raw_readl(EPDC_TCE_HSCAN2);
-		record.regs[12] = __raw_readl(EPDC_TCE_VSCAN);
-		record.regs[13] = __raw_readl(EPDC_TCE_OE);
-		record.regs[14] = __raw_readl(EPDC_TCE_POLARITY);
-		record.regs[15] = __raw_readl(EPDC_TCE_TIMING1);
-		record.regs[16] = __raw_readl(EPDC_TCE_TIMING2);
-		record.regs[17] = __raw_readl(EPDC_TCE_TIMING3);
-		record.regs[18] = __raw_readl(EPDC_IRQ_MASK);
-		record.regs[19] = __raw_readl(EPDC_IRQ);
-		record.regs[20] = __raw_readl(EPDC_IRQ_MASK1);
-		record.regs[21] = __raw_readl(EPDC_IRQ1);
-		record.regs[22] = __raw_readl(EPDC_IRQ_MASK2);
-		record.regs[23] = __raw_readl(EPDC_IRQ2);
-		record.regs[24] = __raw_readl(EPDC_STATUS);
-		record.regs[25] = __raw_readl(EPDC_STATUS_LUTS);
-		record.regs[26] = __raw_readl(EPDC_STATUS_LUTS2);
-		record.regs[27] = __raw_readl(EPDC_STATUS_NEXTLUT);
-		record.regs[28] = __raw_readl(EPDC_STATUS_COL);
-		record.regs[29] = __raw_readl(EPDC_TEMP);
-		record.regs[30] = __raw_readl(EPDC_AUTOWV_LUT);
-		record.regs[31] = __raw_readl(EPDC_UPD_ADDR);
-		record.regs[32] = __raw_readl(EPDC_UPD_STRIDE);
-		record.regs[33] = __raw_readl(EPDC_UPD_CORD);
-		record.regs[34] = __raw_readl(EPDC_UPD_SIZE);
-		record.regs[35] = __raw_readl(EPDC_UPD_CTRL);
-		record.regs[36] = __raw_readl(EPDC_STATUS_COL2);
-		record.active_lut_mask = record.regs[25] |
-			((u64)record.regs[26] << 32);
-		} else {
-			record.safe_regs = 0;
-		}
-		if (!clock_access_held)
-			mutex_unlock(&fb_data->power_mutex);
-	}
-
-	if (pxp_regs) {
-		memcpy(record.pxp_regs, pxp_regs, sizeof(record.pxp_regs));
-		record.pxp_regs_valid = 1;
-		record.pxp_idle = 1;
-	}
-
-	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
-	fb_data->pm_trace[fb_data->pm_trace_next] = record;
-	fb_data->pm_trace_next = (fb_data->pm_trace_next + 1) %
-		E70Q10_PM_TRACE_DEPTH;
-	if (fb_data->pm_trace_count < E70Q10_PM_TRACE_DEPTH)
-		fb_data->pm_trace_count++;
-	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
-}
-
-/* Caller holds queue_mutex; record only the assigned sleep-update LUT. */
-static void epdc_pm_trace_sleep_lut_locked(
-		struct mxc_epdc_fb_data *fb_data,
-		enum e70q10_pm_phase phase, u32 sequence, u32 lut_num,
-		int completion)
-{
-	unsigned long flags;
-	struct e70q10_pm_trace_record *record;
-	u32 slot;
-
-	epdc_pm_trace_capture_locked(fb_data, phase, true, false,
-				     completion, NULL);
-	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
-	if (fb_data->pm_trace_count) {
-		slot = (fb_data->pm_trace_next + E70Q10_PM_TRACE_DEPTH - 1) %
-			E70Q10_PM_TRACE_DEPTH;
-		record = &fb_data->pm_trace[slot];
-		record->sleep_sequence = sequence;
-		record->lut_num = lut_num;
-	}
-	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
-}
 
 static void epdc_sleep_marker_discard_old_locked(
 		struct mxc_epdc_fb_data *fb_data, u32 sequence)
@@ -637,17 +418,6 @@ static void epdc_sleep_marker_discard_old_locked(
 	}
 }
 
-static void epdc_pm_trace_capture(struct mxc_epdc_fb_data *fb_data,
-				  enum e70q10_pm_phase phase,
-				  bool safe_regs,
-				  bool clock_access_held,
-				  const u32 *pxp_regs)
-{
-	mutex_lock(&fb_data->queue_mutex);
-	epdc_pm_trace_capture_locked(fb_data, phase, safe_regs,
-				     clock_access_held, 0, pxp_regs);
-	mutex_unlock(&fb_data->queue_mutex);
-}
 
 static void epdc_sleep_barrier_wake(struct mxc_epdc_fb_data *fb_data)
 {
@@ -2233,8 +2003,7 @@ out:
 	mutex_unlock(&fb_data->power_mutex);
 }
 
-static void epdc_powerdown_locked(struct mxc_epdc_fb_data *fb_data,
-				 bool trace)
+static void epdc_powerdown_locked(struct mxc_epdc_fb_data *fb_data)
 {
 	/* Caller holds power_mutex.  Runtime callers also hold queue_mutex.  The
 	 * legacy boot caller deliberately skips queue/HW-idle bookkeeping.
@@ -2244,9 +2013,6 @@ static void epdc_powerdown_locked(struct mxc_epdc_fb_data *fb_data,
 		return;
 
 	dev_dbg(fb_data->dev, "EPDC Powerdown\n");
-	if (trace)
-		epdc_pm_trace_capture_locked(fb_data,
-			E70Q10_PM_POWERDOWN, true, true, 0, NULL);
 
 	/* Disable power to the EPD panel */
 	epdc_panel_powerdown_locked(fb_data);
@@ -2260,9 +2026,6 @@ static void epdc_powerdown_locked(struct mxc_epdc_fb_data *fb_data,
 		complete(&fb_data->powerdown_compl);
 	}
 
-	if (trace)
-		epdc_pm_trace_capture_locked(fb_data,
-			E70Q10_PM_EPDC_CLOCK_OFF, false, false, 0, NULL);
 	}
 
 /* Boot Mode0 uses the original powerdown semantics and must not depend on
@@ -2271,7 +2034,7 @@ static void epdc_powerdown_locked(struct mxc_epdc_fb_data *fb_data,
 static void epdc_powerdown(struct mxc_epdc_fb_data *fb_data)
 {
 	mutex_lock(&fb_data->power_mutex);
-	epdc_powerdown_locked(fb_data, false);
+	epdc_powerdown_locked(fb_data);
 	mutex_unlock(&fb_data->power_mutex);
 }
 
@@ -2314,7 +2077,7 @@ static int epdc_runtime_powerdown(struct mxc_epdc_fb_data *fb_data)
 		goto out;
 	}
 
-	epdc_powerdown_locked(fb_data, true);
+	epdc_powerdown_locked(fb_data);
 	ret = 0;
 out:
 	mutex_unlock(&fb_data->power_mutex);
@@ -4765,10 +4528,6 @@ static void epdc_submit_work_func(struct work_struct *work)
 		if (upd_data_list->update_desc->sleep_sequence) {
 			fb_data->sleep_lut_sequence[upd_data_list->lut_num] =
 				upd_data_list->update_desc->sleep_sequence;
-			epdc_pm_trace_sleep_lut_locked(fb_data,
-				E70Q10_PM_SLEEP_LUT_ASSIGNED,
-				upd_data_list->update_desc->sleep_sequence,
-				upd_data_list->lut_num, 0);
 		}
 
 		/* Mark LUT with order */
@@ -5470,6 +5229,10 @@ static int epdc_wait_update_marker_timeout(
 	marker_data->collision_test = next_marker->collision_test;
 	if (next_marker->result)
 		ret = next_marker->result;
+	else if (required_sequence)
+		/* completion_timeout returns remaining jiffies on success. The
+		 * strict sleep barrier must continue to its hardware-idle check. */
+		ret = 0;
 
 	mutex_lock(&fb_data->queue_mutex);
 	if (next_marker->retained_sleep &&
@@ -5526,30 +5289,6 @@ static void epdc_sleep_barrier_restore_powerdown_locked(
 	mutex_unlock(&fb_data->power_mutex);
 }
 
-static void epdc_pm_trace_sleep_barrier(
-		struct mxc_epdc_fb_data *fb_data,
-		enum e70q10_pm_phase phase, u32 sequence, u32 marker,
-		int result, const u32 *pxp_regs)
-{
-	unsigned long flags;
-	struct e70q10_pm_trace_record *record;
-	u32 slot;
-
-	mutex_lock(&fb_data->queue_mutex);
-	fb_data->last_sleep_sequence = sequence;
-	epdc_pm_trace_capture_locked(fb_data, phase, true, false,
-				     result, pxp_regs);
-	mutex_unlock(&fb_data->queue_mutex);
-	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
-	if (fb_data->pm_trace_count) {
-		slot = (fb_data->pm_trace_next + E70Q10_PM_TRACE_DEPTH - 1) %
-			E70Q10_PM_TRACE_DEPTH;
-		record = &fb_data->pm_trace[slot];
-		record->sleep_sequence = sequence;
-		record->marker = marker;
-	}
-	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
-}
 
 static unsigned int epdc_sleep_snapshot_refs_locked(
 		struct mxc_epdc_fb_data *fb_data)
@@ -5725,8 +5464,6 @@ static int epdc_e70q10_wait_sleep_barrier(
 		const struct mxcfb_e70q10_sleep_barrier *barrier)
 {
 	unsigned long deadline;
-	u32 pxp_regs[PXP_PM_TRACE_REGS];
-	u32 marker = barrier->marker_count ? barrier->markers[0] : 0;
 	unsigned int i, j;
 	int ret = 0;
 
@@ -5803,16 +5540,14 @@ static int epdc_e70q10_wait_sleep_barrier(
 		goto out_barrier;
 	}
 	ret = epdc_wait_for_hw_idle(fb_data, false,
-			jiffies_to_msecs(deadline - jiffies), pxp_regs);
+			jiffies_to_msecs(deadline - jiffies), NULL);
 	if (ret)
 		goto out_barrier;
 
 out_barrier:
-	if (!ret)
-		epdc_pm_trace_sleep_barrier(fb_data,
-			E70Q10_PM_HW_IDLE_CONFIRMED,
-			barrier->sequence, marker, 1, pxp_regs);
 	mutex_lock(&fb_data->queue_mutex);
+	if (!ret)
+		fb_data->last_sleep_sequence = barrier->sequence;
 	fb_data->sleep_barrier_waiting = false;
 	fb_data->sleep_barrier_pending = false;
 	if (!ret)
@@ -6108,84 +5843,6 @@ static int mxc_epdc_fb_flush_updates(struct mxc_epdc_fb_data *fb_data)
 	return 0;
 }
 
-#ifdef CONFIG_DEBUG_FS
-static int e70q10_pm_trace_show(struct seq_file *seq, void *unused)
-{
-	struct mxc_epdc_fb_data *fb_data = seq->private;
-	struct e70q10_pm_trace_record *records;
-	unsigned long flags;
-	u32 count, start, i, j;
-
-	(void)unused;
-	records = kcalloc(E70Q10_PM_TRACE_DEPTH, sizeof(*records), GFP_KERNEL);
-	if (!records)
-		return -ENOMEM;
-	spin_lock_irqsave(&fb_data->pm_trace_lock, flags);
-	count = fb_data->pm_trace_count;
-	start = (fb_data->pm_trace_next + E70Q10_PM_TRACE_DEPTH - count) %
-		E70Q10_PM_TRACE_DEPTH;
-	for (i = 0; i < count; i++)
-		records[i] = fb_data->pm_trace[(start + i) % E70Q10_PM_TRACE_DEPTH];
-	spin_unlock_irqrestore(&fb_data->pm_trace_lock, flags);
-
-	for (i = 0; i < count; i++) {
-		struct e70q10_pm_trace_record *record = &records[i];
-
-		seq_printf(seq,
-			"ts_ns=%llu resume=%u phase=%s sleep_seq=%u safe=%u submit_blocked=%u powerdown_held=%u updates_active=%u cur=%u pending=%u queued=%u collision=%u markers=%u marker_done=%u free=%u snapshot_busy=%u active_luts=%016llx tce_underruns=%u panel_powerup_result=%d power=%u blank=%u rails=%u/%u/%u marker=%u lut=%u completion=%u",
-			(unsigned long long)record->timestamp_ns,
-			record->resume_sequence,
-			record->phase < ARRAY_SIZE(e70q10_pm_phase_names) ?
-				e70q10_pm_phase_names[record->phase] : "UNKNOWN",
-			record->sleep_sequence,
-			record->safe_regs, record->submit_blocked,
-			record->powerdown_held,
-			record->updates_active, record->cur_update,
-			record->pending_count, record->queued_count,
-			record->collision_count, record->marker_count,
-			record->completed_marker_count,
-			record->free_count,
-			record->snapshot_busy,
-			(unsigned long long)record->active_lut_mask,
-			record->tce_underrun_count,
-			record->panel_powerup_result,
-			record->power_state, record->blank,
-			record->display_enabled, record->vcom_enabled,
-			record->v3p3_enabled, record->marker, record->lut_num,
-			record->completion);
-		if (record->safe_regs) {
-			seq_puts(seq, " regs=");
-			for (j = 0; j < E70Q10_PM_TRACE_REGS; j++)
-				seq_printf(seq, "%s%s=%08x", j ? "," : "",
-					e70q10_pm_reg_names[j], record->regs[j]);
-		}
-		if (record->pxp_regs_valid)
-			seq_printf(seq,
-				" pxp_idle=%u pxp={CTRL:%08x,STAT:%08x,LUT_CTRL:%08x,OUT_BUF:%08x,OUT_PITCH:%08x,OUT_CTRL:%08x,OUT_AS_ULC:%08x}",
-				record->pxp_idle,
-				record->pxp_regs[0], record->pxp_regs[1],
-				record->pxp_regs[2], record->pxp_regs[3],
-				record->pxp_regs[4], record->pxp_regs[5],
-				record->pxp_regs[6]);
-		seq_putc(seq, '\n');
-	}
-	kfree(records);
-	return 0;
-}
-
-static int e70q10_pm_trace_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, e70q10_pm_trace_show, inode->i_private);
-}
-
-static const struct file_operations e70q10_pm_trace_fops = {
-	.owner = THIS_MODULE,
-	.open = e70q10_pm_trace_open,
-	.read = seq_read,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-#endif
 
 static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 {
@@ -6573,9 +6230,6 @@ static void epdc_intr_work_func(struct work_struct *work)
 		if ((epdc_irq_stat & (1ULL << i)) == 0)
 			continue;
 		if (fb_data->sleep_lut_sequence[i]) {
-			epdc_pm_trace_sleep_lut_locked(fb_data,
-				E70Q10_PM_SLEEP_LUT_COMPLETE,
-				fb_data->sleep_lut_sequence[i], i, 1);
 			fb_data->sleep_lut_sequence[i] = 0;
 		}
 		/* Preserve completion evidence across separate IRQ work batches. */
@@ -6736,9 +6390,6 @@ static void epdc_intr_work_func(struct work_struct *work)
 				fb_data->cur_update->lut_num]) {
 				u32 lut = fb_data->cur_update->lut_num;
 
-				epdc_pm_trace_sleep_lut_locked(fb_data,
-					E70Q10_PM_SLEEP_LUT_COMPLETE,
-					fb_data->sleep_lut_sequence[lut], lut, 3);
 				fb_data->sleep_lut_sequence[lut] = 0;
 			}
 
@@ -7097,10 +6748,6 @@ static void epdc_intr_work_func(struct work_struct *work)
 	if (fb_data->cur_update->update_desc->sleep_sequence) {
 		fb_data->sleep_lut_sequence[fb_data->cur_update->lut_num] =
 			fb_data->cur_update->update_desc->sleep_sequence;
-		epdc_pm_trace_sleep_lut_locked(fb_data,
-			E70Q10_PM_SLEEP_LUT_ASSIGNED,
-			fb_data->cur_update->update_desc->sleep_sequence,
-			fb_data->cur_update->lut_num, 0);
 	}
 
 	/* Mark LUT as containing new update */
@@ -8271,7 +7918,6 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 	mutex_init(&fb_data->pxp_mutex);
 	mutex_init(&fb_data->power_mutex);
 	mutex_init(&fb_data->pm_control_mutex);
-	spin_lock_init(&fb_data->pm_trace_lock);
 	spin_lock_init(&fb_data->epdc_recovery_lock);
 	atomic_set(&fb_data->epdc_recovery_state, 0);
 	atomic_set(&fb_data->tce_underrun_count, 0);
@@ -8410,23 +8056,7 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 			fb_data->page_lifetime_stats_created = true;
 		}
 	}
-	if (of_machine_is_compatible("ridi,e70q10")) {
-#ifdef CONFIG_DEBUG_FS
-		fb_data->pm_trace_debugfs = debugfs_create_dir("e70q10_epdc", NULL);
-		if (IS_ERR_OR_NULL(fb_data->pm_trace_debugfs)) {
-			dev_warn(&pdev->dev,
-				 "e70q10 PM trace debugfs unavailable\n");
-			fb_data->pm_trace_debugfs = NULL;
-		} else if (IS_ERR_OR_NULL(debugfs_create_file("pm_trace", 0444,
-				fb_data->pm_trace_debugfs, fb_data,
-				&e70q10_pm_trace_fops))) {
-			dev_warn(&pdev->dev,
-				 "e70q10 PM trace file unavailable\n");
-			debugfs_remove_recursive(fb_data->pm_trace_debugfs);
-			fb_data->pm_trace_debugfs = NULL;
-		}
-#endif
-	}
+
 
 	g_fb_data = fb_data;
 
@@ -8524,9 +8154,6 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 	if (fb_data->page_lifetime_stats_created)
 		device_remove_file(fb_data->info.dev,
 				  &fb_page_lifetime_stats_attr);
-#ifdef CONFIG_DEBUG_FS
-	debugfs_remove_recursive(fb_data->pm_trace_debugfs);
-#endif
 	device_remove_file(fb_data->info.dev, &fb_attrs[0]);
 	unregister_framebuffer(&fb_data->info);
 
@@ -8597,7 +8224,6 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 static int mxc_epdc_fb_suspend(struct device *dev)
 {
 	struct mxc_epdc_fb_data *data = dev_get_drvdata(dev);
-	u32 pxp_regs[PXP_PM_TRACE_REGS];
 	int saved_pwrdown_delay;
 	int ret;
 
@@ -8605,18 +8231,13 @@ static int mxc_epdc_fb_suspend(struct device *dev)
 	mutex_lock(&data->queue_mutex);
 	saved_pwrdown_delay = data->pwrdown_delay;
 	data->system_suspend_in_progress = true;
-	data->pm_resume_sequence++;
 	data->suspend_blocked = true;
 	data->pwrdown_delay = FB_POWERDOWN_DISABLE;
-	epdc_pm_trace_capture_locked(data, E70Q10_PM_SUSPEND_CB_ENTRY,
-		data->power_state == POWER_STATE_ON, false, 0, NULL);
 	mutex_unlock(&data->queue_mutex);
 
 	/* Stop a previously scheduled automatic shutdown before draining. */
 	cancel_delayed_work_sync(&data->epdc_done_work);
 	ret = mxc_epdc_fb_flush_updates(data);
-	epdc_pm_trace_capture(data, E70Q10_PM_FLUSH_END,
-			     data->power_state == POWER_STATE_ON, false, NULL);
 	if (ret)
 		goto abort_suspend;
 
@@ -8637,11 +8258,9 @@ static int mxc_epdc_fb_suspend(struct device *dev)
 			goto abort_suspend;
 	}
 
-	ret = epdc_wait_for_hw_idle(data, true, 5000, pxp_regs);
+	ret = epdc_wait_for_hw_idle(data, true, 5000, NULL);
 	if (ret)
 		goto abort_suspend;
-	epdc_pm_trace_capture(data, E70Q10_PM_SUSPEND_HW_IDLE_CONFIRMED,
-			     data->power_state == POWER_STATE_ON, false, pxp_regs);
 
 	ret = mxc_epdc_fb_blank(FB_BLANK_POWERDOWN, &data->info);
 	if (ret)
