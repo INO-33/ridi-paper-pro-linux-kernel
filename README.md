@@ -25,6 +25,9 @@ Android 전체를 만들 때는 이 저장소만 따로 복사하기보다 메�
 `vendor/nxp-opensource/kernel_imx`입니다. 환경 설정 후:
 
 ```sh
+"$ANDROID_BUILD_TOP/ridi-build-support/build.sh" build e70q10_reference-eng kernelimage
+python3 "$ANDROID_BUILD_TOP/ridi-build-support/build-wifi.py"
+export E70Q10_WIFI_MODULE="${E70Q10_OUT_DIR:-$RIDI_WORKSPACE/android-out/e70q10_reference}/wifi/8189fs.ko"
 "$ANDROID_BUILD_TOP/ridi-build-support/build.sh" build e70q10_reference-eng bootimage vendorimage
 ```
 
