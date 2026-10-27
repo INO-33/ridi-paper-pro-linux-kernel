@@ -47,3 +47,11 @@ Linux 원본의 저작권·라이선스는 [`COPYING`](COPYING)을 따릅니다.
 
 처음 구성하는 개발자는 메인 저장소의 [개발환경 구축 안내](https://github.com/INO-33/ridi-paper-pro/blob/checkpoint-20261016/DEVELOPMENT.md)를 따릅니다.
 공개 전 제외·확인 대상은 [공개 자산 목록](https://github.com/INO-33/ridi-paper-pro/blob/checkpoint-20261016/PUBLIC_ASSETS.md)에 있습니다.
+
+
+## 사용 대상과 라이선스
+
+기존 리디 페이퍼 프로 사용자를 위한 프로젝트입니다. [LICENSING.md](LICENSING.md)와
+[DEVICE_ASSETS.md](DEVICE_ASSETS.md)를 확인하세요. 타 기기 포팅에서는 기기 유래 자산을 제외합니다.
+기존 코드·드라이버·폰트의 오픈소스 라이선스는 그대로 유지합니다.
+과거 포팅 기록과 설명이 다를 경우 이 라이선스 문서와 메인 PUBLIC_ASSETS.md의 최신 검토를 기준으로 합니다.
