@@ -51,6 +51,8 @@ Module.symvers
 /vmlinuz
 /System.map
 /Module.markers
+/defconfig
+/host-tools/
 
 #
 # Debian directory (make deb-pkg)

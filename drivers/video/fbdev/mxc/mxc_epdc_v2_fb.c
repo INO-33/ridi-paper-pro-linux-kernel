@@ -141,7 +141,7 @@ struct mxc_epdc_fb_data {
 	struct fb_var_screeninfo epdc_fb_var; /* Internal copy of screeninfo
 						so we can sync changes to it */
 	u32 pseudo_palette[16];
-	char fw_str[24];
+	char fw_str[64];
 	struct list_head list;
 	struct imx_epdc_fb_mode *cur_mode;
 	struct imx_epdc_fb_platform_data *pdata;
@@ -4847,11 +4847,13 @@ static int mxc_epdc_fb_init_hw(struct fb_info *info)
 	 * Create fw search string based on ID string in selected videomode.
 	 * Format is "imx/epdc/epdc_[panel string].fw"
 	 */
-	if (fb_data->cur_mode) {
-		strcat(fb_data->fw_str, "imx/epdc/epdc_");
-		strcat(fb_data->fw_str, fb_data->cur_mode->vmode->name);
-		strcat(fb_data->fw_str, ".fw");
-	}
+	if (!fb_data->cur_mode || !fb_data->cur_mode->vmode ||
+	    !fb_data->cur_mode->vmode->name)
+		return -EINVAL;
+
+	snprintf(fb_data->fw_str, sizeof(fb_data->fw_str),
+		 "imx/epdc/epdc_%s.fw",
+		 fb_data->cur_mode->vmode->name);
 
 	fb_data->fw_default_load = false;
 
