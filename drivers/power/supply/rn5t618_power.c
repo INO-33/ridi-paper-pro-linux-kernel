@@ -60,6 +60,8 @@
 #define FG_ENABLE                       BIT(0)
 #define RN5T618_POLL_FAST_MS            2000
 #define RN5T618_POLL_IDLE_MS            5000
+/* Hysteresis: a rejected event is forgotten once VBAT reads at least this. */
+#define RN5T618_VBAT_REARM_UV 3650000
 
 static int rn5t618_sign_extend(u16 value, unsigned int sign_bit)
 {
@@ -79,6 +81,15 @@ struct rn5t618_power_info {
 	bool low_battery_pending;
 	bool low_battery_irq_fault;
 	bool low_battery_stopping;
+	/* A VBAT-low event the >10% guard rejected. While set, suspend does not
+	 * re-arm the comparator, so a resting voltage below 3.55 V cannot turn
+	 * every suspend into an immediate wake. Cleared once an event would be
+	 * accepted (offline and displayed <=10%) or the voltage has recovered.
+	 */
+	bool low_battery_rejected;
+	unsigned int low_battery_events;
+	unsigned int low_battery_rejects;
+	unsigned int low_battery_rearm_skips;
 	int charger_irq;
 	bool charger_irq_wake;
 	bool charger_irq_fault;
@@ -651,7 +662,23 @@ static int rn5t618_stock_update(struct rn5t618_power_info *info,
 	}
 	if (READ_ONCE(info->low_battery_pending)) {
 		WRITE_ONCE(info->low_battery_pending, false);
-		ridi_stock_low_battery(soc, &s);
+		info->low_battery_events++;
+		if (!ridi_stock_low_battery(soc, &s)) {
+			info->low_battery_rejected = true;
+			info->low_battery_rejects++;
+			dev_info(&info->pdev->dev,
+				 "RIDI_POWER vbat-low rejected dsoc=%d voltage_uv=%d current_ma=%d online=%d rejects=%u; comparator held off\n",
+				 soc->dsoc, s.voltage_uv, s.current_ma, s.online,
+				 info->low_battery_rejects);
+		}
+	}
+	if (info->low_battery_rejected &&
+	    (s.online || s.voltage_uv >= RN5T618_VBAT_REARM_UV ||
+	     (soc->dsoc + 50) / 100 <= 10)) {
+		info->low_battery_rejected = false;
+		dev_info(&info->pdev->dev,
+			 "RIDI_POWER vbat-low comparator re-enabled dsoc=%d voltage_uv=%d online=%d\n",
+			 soc->dsoc, s.voltage_uv, s.online);
 	}
 	info->reported_soc = (soc->dsoc + 50) / 100;
 	info->reported_valid = true;
@@ -704,7 +731,7 @@ static ssize_t stock_soc_show(struct device *dev,
 
 	mutex_lock(&info->capacity_lock);
 	len = scnprintf(buf, PAGE_SIZE,
-		"enabled=%d profile_ready=%d dsoc=%d integrated=%d raw=%d full=%d full_anchor=%d online=%d complete=%d zero=%d cc_origin=0x%08x sample_cc=0x%08x voltage_uv=%d current_ma=%d last_sleep_sec=%llu sleep_model=%d sleep_cc_mas=%d cc_discontinuities=%u low_irq=%d low_pending=%d low_irq_fault=%d\n",
+		"enabled=%d profile_ready=%d dsoc=%d integrated=%d raw=%d full=%d full_anchor=%d online=%d complete=%d zero=%d cc_origin=0x%08x sample_cc=0x%08x voltage_uv=%d current_ma=%d last_sleep_sec=%llu sleep_model=%d sleep_cc_mas=%d cc_discontinuities=%u low_irq=%d low_pending=%d low_irq_fault=%d low_events=%u low_rejects=%u low_rejected=%d low_rearm_skips=%u\n",
 		info->stock_enabled, info->stock_profile_ready, soc->dsoc, soc->integrated,
 		soc->last.raw_soc, soc->full, soc->full_anchor,
 		soc->last.online, soc->last.complete, soc->zero, soc->last_cc, soc->last.cc,
@@ -712,7 +739,9 @@ static ssize_t stock_soc_show(struct device *dev,
 		(unsigned long long)soc->last_sleep_sec, soc->used_sleep_model,
 		soc->last_sleep_cc_mas,
 		soc->cc_discontinuities, info->low_battery_irq,
-		READ_ONCE(info->low_battery_pending), info->low_battery_irq_fault);
+		READ_ONCE(info->low_battery_pending), info->low_battery_irq_fault,
+		info->low_battery_events, info->low_battery_rejects,
+		info->low_battery_rejected, info->low_battery_rearm_skips);
 	mutex_unlock(&info->capacity_lock);
 	return len;
 }
@@ -1513,13 +1542,16 @@ static int rn5t618_power_remove(struct platform_device *pdev)
 static int rn5t618_power_suspend(struct device *dev)
 {
 	struct rn5t618_power_info *info = dev_get_drvdata(dev);
-
+	bool rearm_low = true;
 	int ret;
 
 	/* No periodic I2C polling while the PMIC/I2C parent is suspended. */
 	cancel_delayed_work_sync(&info->poll_work);
 	if (info->stock_enabled) {
 		mutex_lock(&info->capacity_lock);
+		rearm_low = !info->low_battery_rejected;
+		if (!rearm_low)
+			info->low_battery_rearm_skips++;
 		ret = rn5t618_stock_checkpoint(info);
 		if (ret)
 			dev_warn(dev, "pre-suspend SOC save failed: %d\n", ret);
@@ -1535,7 +1567,7 @@ static int rn5t618_power_suspend(struct device *dev)
 		schedule_delayed_work(&info->poll_work, 0);
 		return -EIO;
 	}
-	if (info->low_battery_irq) {
+	if (info->low_battery_irq && rearm_low) {
 		ret = regmap_update_bits(info->rn5t618->regmap, RN5T618_EN_ADCIR1,
 				 RC5T619_VBAT_LOW, RC5T619_VBAT_LOW);
 		if (ret) {

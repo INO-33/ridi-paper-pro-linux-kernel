@@ -592,3 +592,12 @@
 	no-1-8-v;
 	status = "okay";
 };
+
+/* The Vivante 2D/VG cores are unused: Android renders in software (swrast,
+ * no libGAL/libg2d). galcore powers the GPU on and off on every resume and
+ * appends to its kernel command queue; with no user commits the queue never
+ * frees, and resume blocks forever on the ~512th suspend (watchdog reset).
+ */
+&gpu {
+	status = "disabled";
+};

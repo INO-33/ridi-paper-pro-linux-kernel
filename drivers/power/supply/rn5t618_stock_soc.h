@@ -272,17 +272,20 @@ static void ridi_stock_finish(struct ridi_stock_soc *soc,
 	soc->last = *s;
 }
 
-/* Stock critical IRQ guard: external power or >10% rejects false critical. */
-static void ridi_stock_low_battery(struct ridi_stock_soc *soc,
+/* Stock critical IRQ guard: external power or >10% rejects false critical.
+ * Returns false when the event was rejected.
+ */
+static bool ridi_stock_low_battery(struct ridi_stock_soc *soc,
 				   const struct ridi_stock_sample *s)
 {
 	if (s->online || (soc->dsoc + 50) / 100 > 10)
-		return;
+		return false;
 	soc->critical_irq = true;
 	soc->dsoc = 0;
 	soc->full_anchor = false;
 	soc->zero = true;
 	soc->critical_pending = false;
+	return true;
 }
 
 static void ridi_stock_step(struct ridi_stock_soc *soc,

@@ -55,6 +55,7 @@
 #include <linux/mxcfb_epdc.h>
 #include <linux/gpio.h>
 #include <linux/regulator/driver.h>
+#include <linux/regulator/tps65185.h>
 #include <linux/fsl_devices.h>
 #include <linux/bitops.h>
 #include <linux/spinlock.h>
@@ -84,6 +85,9 @@
 #define EPDC_V2_MAX_NUM_UPDATES 64
 #define EPDC_MAX_NUM_BUFFERS	2
 #define E70Q10_SOURCE_SNAPSHOT_SLOTS	3
+#define E70Q10_SNAPSHOT_BAND_ROWS	8
+#define E70Q10_SNAPSHOT_BAND_WORDS	4
+#define E70Q10_SNAPSHOT_MAX_BANDS	256
 #define E70Q10_SLEEP_BARRIER_TIMEOUT_MS	2500
 #define INVALID_LUT		(-1)
 #define DRY_RUN_NO_LUT		100
@@ -198,6 +202,9 @@ struct e70q10_source_snapshot {
 	u32 fb_offset;
 	u64 generation;
 	u32 refs;
+	u32 sleep_sequence; /* Sleep overlays may modify a page without pan. */
+	bool full_frame;
+	u64 covered_bands[E70Q10_SNAPSHOT_BAND_WORDS];
 };
 
 
@@ -242,6 +249,15 @@ struct mxc_epdc_fb_data {
 	u64 source_snapshot_copies;
 	u64 source_snapshot_hits;
 	u64 source_snapshot_busy;
+	u64 source_snapshot_bytes;
+	u64 source_snapshot_partial_copies;
+	u64 source_snapshot_coverage_misses;
+	u64 source_snapshot_merge_blocks;
+	bool source_snapshot_force_full;
+	bool source_bounds_valid;
+	u64 source_bounds_generation;
+	pid_t source_bounds_owner;
+	struct mxcfb_e70q10_source_bounds source_bounds;
 	u64 collision_created;
 	u64 collision_retry_submitted;
 	u64 collision_retry_dropped_newer;
@@ -313,6 +329,10 @@ struct mxc_epdc_fb_data {
 	u32 cleanup_fence_marker;
 	int trt_entries;
 	int temp_index;
+	/* power_mutex protects the sampled temperature and manual override. */
+	int ambient_temperature;
+	bool temperature_override;
+	unsigned long temperature_next_sample;
 	u8 *temp_range_bounds;
 	int buf_pix_fmt;
 	struct mxcfb_waveform_modes wv_modes;
@@ -486,7 +506,7 @@ static void epdc_record_fb_page_reuse(struct mxc_epdc_fb_data *fb_data,
  * E70Q10 queues EPDC work after MXCFB_SEND_UPDATE returns, while Android may
  * recycle the posted framebuffer page immediately because HWC1 has no release
  * fence.  Keep an immutable RGB565 source until the update descriptor becomes
- * terminal.  All helpers below are called with queue_mutex held.
+ * terminal. Mutation helpers hold queue_mutex; coverage readers own a ref.
  */
 static void e70q10_source_snapshot_put_locked(
 		struct mxc_epdc_fb_data *fb_data,
@@ -517,6 +537,88 @@ static void epdc_free_update_desc_locked(struct mxc_epdc_fb_data *fb_data,
 	kfree(desc);
 }
 
+static bool e70q10_snapshot_read_bands(struct mxc_epdc_fb_data *fb_data,
+		const struct mxcfb_rect *rect, u32 *first, u32 *last)
+{
+	u32 rows = fb_data->info.var.yres;
+	u32 width = fb_data->epdc_fb_var.xres;
+	u64 end;
+
+	if (!rect->width || !rect->height || rect->left >= width ||
+	    rect->width > width - rect->left || rect->top >= rows ||
+	    rect->height > rows - rect->top ||
+	    DIV_ROUND_UP(rows, E70Q10_SNAPSHOT_BAND_ROWS) >
+		E70Q10_SNAPSHOT_MAX_BANDS)
+		return false;
+	end = (u64)rect->top + ALIGN(rect->height,
+				      E70Q10_SNAPSHOT_BAND_ROWS);
+	*first = rect->top / E70Q10_SNAPSHOT_BAND_ROWS;
+	/* Allocated rows beyond the visible framebuffer remain white. */
+	*last = DIV_ROUND_UP(min_t(u64, end, rows),
+			     E70Q10_SNAPSHOT_BAND_ROWS);
+	return true;
+}
+
+static bool e70q10_snapshot_covers_rect(struct mxc_epdc_fb_data *fb_data,
+		const struct e70q10_source_snapshot *snapshot,
+		const struct mxcfb_rect *rect)
+{
+	u32 first, last, band;
+
+	if (!snapshot)
+		return true; /* Legacy paths retain their own lifetime. */
+	if (snapshot->full_frame)
+		return true;
+	if (!e70q10_snapshot_read_bands(fb_data, rect, &first, &last))
+		return false;
+	for (band = first; band < last; band++)
+		if (!(snapshot->covered_bands[band / 64] &
+		      (1ULL << (band % 64))))
+			return false;
+	return true;
+}
+
+/* queue_mutex held. A producer explicitly opts in after pan, before SEND.
+ * No kernel inference of write ownership is made from generation alone.
+ */
+static int e70q10_set_source_bounds(struct mxc_epdc_fb_data *fb_data,
+		const struct mxcfb_e70q10_source_bounds *bounds)
+{
+	u32 first, last, i;
+	int ret = 0;
+
+	if (!of_machine_is_compatible("ridi,e70q10"))
+		return -EOPNOTSUPP;
+	mutex_lock(&fb_data->queue_mutex);
+	fb_data->source_bounds_valid = false;
+	if (!bounds->update_region.width && !bounds->update_region.height)
+		goto out;
+	if (bounds->fb_offset != fb_data->fb_offset ||
+	    !e70q10_snapshot_read_bands(fb_data, &bounds->update_region,
+				      &first, &last)) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* Do not change the contract of a generation already captured. */
+	for (i = 0; i < fb_data->source_snapshot_count; i++) {
+		struct e70q10_source_snapshot *slot =
+			&fb_data->source_snapshots[i];
+
+		if (slot->refs &&
+		    slot->generation == fb_data->fb_source_generation) {
+			ret = -EBUSY;
+			goto out;
+		}
+	}
+	fb_data->source_bounds = *bounds;
+	fb_data->source_bounds_generation = fb_data->fb_source_generation;
+	fb_data->source_bounds_owner = task_tgid_nr(current);
+	fb_data->source_bounds_valid = true;
+out:
+	mutex_unlock(&fb_data->queue_mutex);
+	return ret;
+}
+
 static void e70q10_copy_frame_to_snapshot_locked(
 		struct mxc_epdc_fb_data *fb_data,
 		struct e70q10_source_snapshot *snapshot, u32 fb_offset,
@@ -532,8 +634,112 @@ static void e70q10_copy_frame_to_snapshot_locked(
 		       fb_data->source_snapshot_copy_size);
 	/* Publish CPU stores before PxP is allowed to DMA-read this slot. */
 	wmb();
+	snapshot->sleep_sequence = 0;
+	snapshot->full_frame = true;
+	memset(snapshot->covered_bands, 0xff, sizeof(snapshot->covered_bands));
 	snapshot->fb_offset = fb_offset;
 	snapshot->generation = generation;
+	fb_data->source_snapshot_bytes += fb_data->source_snapshot_copy_size;
+}
+
+static bool e70q10_snapshot_include_rect(struct mxc_epdc_fb_data *fb_data,
+		const struct mxcfb_rect *rect, u32 *first, u32 *last)
+{
+	u32 begin, end;
+
+	if (!e70q10_snapshot_read_bands(fb_data, rect, &begin, &end))
+		return false;
+	*first = min(*first, begin);
+	*last = max(*last, end);
+	return true;
+}
+
+static void e70q10_capture_source_locked(struct mxc_epdc_fb_data *fb_data,
+		struct e70q10_source_snapshot *slot,
+		struct update_desc_list *desc)
+{
+	struct update_desc_list *pending;
+	struct update_data_list *update;
+	const struct mxcfb_rect *hint = &fb_data->source_bounds.update_region;
+	const struct mxcfb_rect *rect = &desc->upd_data.update_region;
+	u32 first = E70Q10_SNAPSHOT_MAX_BANDS, last = 0, band, bands;
+	size_t offset, bytes;
+
+	if (fb_data->source_snapshot_force_full ||
+	    !fb_data->source_bounds_valid ||
+	    fb_data->source_bounds_owner != task_tgid_nr(current) ||
+	    fb_data->source_bounds_generation != desc->fb_source_generation ||
+	    fb_data->source_bounds.fb_offset != desc->fb_offset ||
+	    fb_data->epdc_fb_var.bits_per_pixel != 16 ||
+	    desc->sleep_sequence || desc->upd_data.update_marker ||
+	    desc->upd_data.flags || desc->upd_data.temp != TEMP_USE_AMBIENT ||
+	    desc->upd_data.update_mode != UPDATE_MODE_PARTIAL ||
+	    desc->upd_data.waveform_mode != WAVEFORM_MODE_AUTO ||
+	    rect->left < hint->left || rect->top < hint->top ||
+	    (u64)rect->left + rect->width > (u64)hint->left + hint->width ||
+	    (u64)rect->top + rect->height > (u64)hint->top + hint->height ||
+	    !e70q10_snapshot_include_rect(fb_data, hint, &first, &last) ||
+	    !e70q10_snapshot_include_rect(fb_data, rect, &first, &last))
+		goto full;
+
+	/* Include pending, selected, active and collision merge sources.
+	 * Copy the bounding band range, including gaps between rectangles.
+	 */
+	list_for_each_entry(pending, &fb_data->upd_pending_list, list)
+		if (!e70q10_snapshot_include_rect(fb_data,
+				&pending->upd_data.update_region,
+				&first, &last))
+			goto full;
+	list_for_each_entry(update, &fb_data->upd_buf_collision_list, list)
+		if (update->update_desc &&
+		    !e70q10_snapshot_include_rect(fb_data,
+				&update->update_desc->upd_data.update_region,
+				&first, &last))
+			goto full;
+	list_for_each_entry(update, &fb_data->upd_buf_queue, list)
+		if (update->update_desc &&
+		    !e70q10_snapshot_include_rect(fb_data,
+				&update->update_desc->upd_data.update_region,
+				&first, &last))
+			goto full;
+	if (fb_data->cur_update && fb_data->cur_update->update_desc &&
+	    !e70q10_snapshot_include_rect(fb_data,
+		&fb_data->cur_update->update_desc->upd_data.update_region,
+		&first, &last))
+		goto full;
+
+	bands = DIV_ROUND_UP(fb_data->info.var.yres, E70Q10_SNAPSHOT_BAND_ROWS);
+	if (first)
+		first--; /* One extra band on each side for aligned retries. */
+	last = min(last + 1, bands);
+	if (!first && last == bands)
+		goto full;
+	offset = (size_t)first * E70Q10_SNAPSHOT_BAND_ROWS *
+		 fb_data->info.fix.line_length;
+	bytes = min_t(size_t, (size_t)last * E70Q10_SNAPSHOT_BAND_ROWS *
+		      fb_data->info.fix.line_length,
+		      fb_data->source_snapshot_copy_size) - offset;
+	memcpy((u8 *)slot->virt_addr + offset,
+	       (u8 *)fb_data->info.screen_base + desc->fb_offset + offset,
+	       bytes);
+	/* Probe initializes the allocated tail white. No partial copy writes
+	 * beyond copy_size, so that padding needs no per-generation rewrite.
+	 */
+	/* Publish copied rows before DMA can read this slot. */
+	wmb();
+	slot->full_frame = false;
+	memset(slot->covered_bands, 0, sizeof(slot->covered_bands));
+	for (band = first; band < last; band++)
+		slot->covered_bands[band / 64] |= 1ULL << (band % 64);
+	slot->fb_offset = desc->fb_offset;
+	slot->generation = desc->fb_source_generation;
+	fb_data->source_snapshot_bytes += bytes;
+	fb_data->source_snapshot_partial_copies++;
+	return;
+full:
+	e70q10_copy_frame_to_snapshot_locked(fb_data, slot,
+			desc->fb_offset, desc->fb_source_generation);
+	fb_data->source_snapshot_force_full = false;
 }
 
 static bool e70q10_promote_deferred_snapshot_locked(
@@ -564,6 +770,12 @@ static bool e70q10_promote_deferred_snapshot_locked(
 		       0xff, fb_data->source_snapshot_size -
 		       fb_data->source_snapshot_copy_size);
 	wmb();
+	slot->sleep_sequence = fb_data->deferred_latest_snapshot.sleep_sequence;
+	slot->full_frame = fb_data->deferred_latest_snapshot.full_frame;
+	memcpy(slot->covered_bands,
+	       fb_data->deferred_latest_snapshot.covered_bands,
+	       sizeof(slot->covered_bands));
+	fb_data->source_snapshot_bytes += fb_data->source_snapshot_copy_size;
 	slot->fb_offset = fb_data->deferred_latest_snapshot.fb_offset;
 	slot->generation = fb_data->deferred_latest_snapshot.generation;
 	slot->refs = 1;
@@ -597,7 +809,7 @@ static int e70q10_source_snapshot_acquire_locked(
 
 	/*
 	 * Multiple dirty rectangles generated by one fb_post share the same
-	 * immutable full-frame copy while at least one descriptor still owns it.
+	 * immutable source while at least one descriptor still owns it.
 	 * A zero-ref slot is never treated as a cache hit: generic mmap users may
 	 * change framebuffer bytes without issuing FBIOPAN_DISPLAY.
 	 */
@@ -607,7 +819,17 @@ static int e70q10_source_snapshot_acquire_locked(
 
 		if (candidate->refs &&
 		    candidate->fb_offset == desc->fb_offset &&
-		    candidate->generation == desc->fb_source_generation) {
+		    candidate->generation == desc->fb_source_generation &&
+		    candidate->sleep_sequence == desc->sleep_sequence) {
+			if ((!candidate->full_frame &&
+			     (desc->sleep_sequence ||
+			      desc->upd_data.update_marker)) ||
+			    !e70q10_snapshot_covers_rect(fb_data, candidate,
+					&desc->upd_data.update_region)) {
+				fb_data->source_snapshot_coverage_misses++;
+				fb_data->source_snapshot_force_full = true;
+				return -EAGAIN;
+			}
 			candidate->refs++;
 			desc->source_snapshot = candidate;
 			fb_data->source_snapshot_hits++;
@@ -621,8 +843,9 @@ static int e70q10_source_snapshot_acquire_locked(
 		return -EBUSY;
 	}
 
-	e70q10_copy_frame_to_snapshot_locked(fb_data, slot,
-		desc->fb_offset, desc->fb_source_generation);
+	e70q10_capture_source_locked(fb_data, slot, desc);
+	/* An in-place sleep overlay is a separate immutable image namespace. */
+	slot->sleep_sequence = desc->sleep_sequence;
 	slot->refs = 1;
 	desc->source_snapshot = slot;
 	fb_data->source_snapshot_copies++;
@@ -1865,7 +2088,9 @@ static int epdc_powerup_clocks_locked(struct mxc_epdc_fb_data *fb_data)
 		if (ret)
 			return ret;
 		fb_data->v3p3_enabled = true;
-		msleep(1);
+		/* E70Q10 V3P3 is a no-op; TPS handles its own settling. */
+		if (!of_machine_is_compatible("ridi,e70q10"))
+			msleep(1);
 	}
 
 	if (!fb_data->runtime_pm_held) {
@@ -1973,6 +2198,48 @@ static void epdc_powerdown_clocks_locked(struct mxc_epdc_fb_data *fb_data)
 	}
 }
 
+/* Called with power_mutex held, after panel power has been established.
+ * Do not take queue_mutex here: some submission paths already hold it.
+ * The scalar ambient index is published atomically to submission readers.
+ */
+static void epdc_update_temperature_locked(struct mxc_epdc_fb_data *fb_data)
+{
+	int temperature, index, ret;
+
+	if (!of_machine_is_compatible("ridi,e70q10") ||
+	    fb_data->temperature_override || !fb_data->trt_entries ||
+	    (fb_data->temperature_next_sample &&
+	     time_before(jiffies, fb_data->temperature_next_sample)))
+		return;
+
+	ret = tps65185_read_temperature(fb_data->display_regulator,
+					&temperature);
+	if (ret) {
+		/* Keep the last good index (initially 20C).
+		 * Back off errors to avoid stalling every update.
+		 */
+		fb_data->temperature_next_sample =
+			jiffies + msecs_to_jiffies(5000);
+		dev_warn_ratelimited(fb_data->dev,
+			"EPDC temperature read failed (%d), retaining %dC\n",
+			ret, fb_data->ambient_temperature);
+		return;
+	}
+	index = mxc_epdc_fb_get_temp_index(fb_data, temperature);
+	fb_data->ambient_temperature = temperature;
+	WRITE_ONCE(fb_data->temp_index, index);
+	fb_data->temperature_next_sample = jiffies + msecs_to_jiffies(60000);
+	dev_dbg(fb_data->dev, "EPDC ambient temperature %dC, TRT index %d\n",
+		temperature, index);
+}
+
+static int epdc_flush_panel_powerdown(struct mxc_epdc_fb_data *fb_data)
+{
+	if (!of_machine_is_compatible("ridi,e70q10"))
+		return 0;
+	return tps65185_flush_powerdown(fb_data->display_regulator);
+}
+
 static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 {
 	int ret;
@@ -1981,8 +2248,10 @@ static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 	if (fb_data->powering_down)
 		fb_data->powering_down = false;
 	fb_data->updates_active = true;
-	if (fb_data->power_state == POWER_STATE_ON)
+	if (fb_data->power_state == POWER_STATE_ON) {
+		epdc_update_temperature_locked(fb_data);
 		goto out;
+	}
 
 	dev_dbg(fb_data->dev, "EPDC Powerup\n");
 	ret = epdc_powerup_clocks_locked(fb_data);
@@ -1994,6 +2263,7 @@ static void epdc_powerup(struct mxc_epdc_fb_data *fb_data)
 		goto fail;
 	}
 	fb_data->power_state = POWER_STATE_ON;
+	epdc_update_temperature_locked(fb_data);
 	goto out;
 
 fail:
@@ -3026,9 +3296,20 @@ int mxc_epdc_fb_set_temperature(int temperature, struct fb_info *info)
 	struct mxc_epdc_fb_data *fb_data = info ?
 		(struct mxc_epdc_fb_data *)info:g_fb_data;
 
-	/* Store temp index. Used later when configuring updates. */
+	/* Keep manual control; AMBIENT restores the E70Q10 sensor. */
 	mutex_lock(&fb_data->queue_mutex);
-	fb_data->temp_index = mxc_epdc_fb_get_temp_index(fb_data, temperature);
+	mutex_lock(&fb_data->power_mutex);
+	if (temperature == TEMP_USE_AMBIENT &&
+	    of_machine_is_compatible("ridi,e70q10")) {
+		fb_data->temperature_override = false;
+		fb_data->temperature_next_sample = 0;
+	} else {
+		fb_data->temperature_override = true;
+		fb_data->ambient_temperature = temperature;
+		WRITE_ONCE(fb_data->temp_index,
+			mxc_epdc_fb_get_temp_index(fb_data, temperature));
+	}
+	mutex_unlock(&fb_data->power_mutex);
 	mutex_unlock(&fb_data->queue_mutex);
 
 	return 0;
@@ -3385,16 +3666,8 @@ static bool epdc_reuse_pending_snapshot_locked(
 	if (!slot)
 		return false;
 
-	memcpy(slot->virt_addr,
-	       (u8 *)fb_data->info.screen_base + newest->fb_offset,
-	       fb_data->source_snapshot_copy_size);
-	if (fb_data->source_snapshot_size > fb_data->source_snapshot_copy_size)
-		memset((u8 *)slot->virt_addr + fb_data->source_snapshot_copy_size,
-		       0xff, fb_data->source_snapshot_size -
-		       fb_data->source_snapshot_copy_size);
-	wmb();
-	slot->fb_offset = newest->fb_offset;
-	slot->generation = newest->fb_source_generation;
+	e70q10_copy_frame_to_snapshot_locked(fb_data, slot,
+			newest->fb_offset, newest->fb_source_generation);
 	slot->refs++; /* new descriptor reference; pending refs are put below */
 	newest->source_snapshot = slot;
 	fb_data->source_snapshot_copies++;
@@ -3412,6 +3685,11 @@ static void epdc_apply_pending_coalesce_locked(
 	if (!plan->desc_count || !plan->oldest)
 		return;
 
+	if (!e70q10_snapshot_covers_rect(fb_data, newest->source_snapshot,
+					&plan->damage)) {
+		fb_data->source_snapshot_merge_blocks++;
+		return;
+	}
 	newest->upd_data.update_region = plan->damage;
 	for (;;) {
 		candidate = list_entry(fb_data->upd_pending_list.prev,
@@ -3591,6 +3869,18 @@ static int epdc_process_update(struct update_data_list *upd_data_list,
 
 	int ret;
 
+	if (!(upd_desc_list->upd_data.flags & EPDC_FLAG_USE_ALT_BUFFER) &&
+	    !e70q10_snapshot_covers_rect(fb_data,
+			upd_desc_list->source_snapshot,
+			&upd_desc_list->upd_data.update_region)) {
+		mutex_lock(&fb_data->queue_mutex);
+		fb_data->source_snapshot_coverage_misses++;
+		fb_data->source_snapshot_force_full = true;
+		mutex_unlock(&fb_data->queue_mutex);
+		dev_err_ratelimited(fb_data->dev,
+			"EPDC snapshot coverage missing; refusing mixed-frame DMA\n");
+		return -EIO;
+	}
 
 	/*
 	 * Gotta do a whole bunch of buffer ptr manipulation to
@@ -3939,6 +4229,12 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 	arect = &upd_desc_list->upd_data.update_region;
 	brect = &update_to_merge->upd_data.update_region;
 
+	/* Keep in-place sleep images separate from ordinary frames. */
+	if (upd_desc_list->sleep_sequence != update_to_merge->sleep_sequence) {
+		fb_data->source_snapshot_merge_blocks++;
+		return MERGE_BLOCK;
+	}
+
 	/*
 	 * A full-panel GC16 is a physical cleanup, not just another update
 	 * candidate. Merging it with another update can turn its waveform into AUTO
@@ -3973,6 +4269,31 @@ static int epdc_submit_merge(struct update_desc_list *upd_desc_list,
 		}
 
 		use_flags = true;
+	}
+
+	combine.left = min(arect->left, brect->left);
+	combine.top = min(arect->top, brect->top);
+	combine.width = max(arect->left + arect->width,
+			    brect->left + brect->width) - combine.left;
+	combine.height = max(arect->top + arect->height,
+			     brect->top + brect->height) - combine.top;
+	{
+		struct e70q10_source_snapshot *source;
+
+		if (update_to_merge->update_order >=
+		    upd_desc_list->update_order)
+			source = update_to_merge->source_snapshot;
+		else
+			source = upd_desc_list->source_snapshot;
+
+		if (!e70q10_snapshot_covers_rect(fb_data, source, &combine) ||
+		    (source && !source->full_frame &&
+		     (upd_desc_list->sleep_sequence ||
+		      update_to_merge->sleep_sequence ||
+		      a->update_marker || b->update_marker))) {
+			fb_data->source_snapshot_merge_blocks++;
+			return MERGE_BLOCK;
+		}
 	}
 
 	if (a->update_mode != b->update_mode)
@@ -4547,7 +4868,7 @@ static void epdc_submit_work_func(struct work_struct *work)
 			upd_data_list->update_desc->upd_data.temp);
 		epdc_set_temp(temp_index);
 	} else
-		epdc_set_temp(fb_data->temp_index);
+		epdc_set_temp(READ_ONCE(fb_data->temp_index));
 	epdc_set_update_addr(update_addr);
 	epdc_set_update_coord(adj_update_region.left, adj_update_region.top);
 	epdc_set_update_dimensions(adj_update_region.width,
@@ -5018,7 +5339,7 @@ static int __mxc_epdc_fb_send_single_update(
 			upd_desc->upd_data.temp);
 		epdc_set_temp(temp_index);
 	} else
-		epdc_set_temp(fb_data->temp_index);
+		epdc_set_temp(READ_ONCE(fb_data->temp_index));
 	if (fb_data->wv_modes_update &&
 		(upd_desc->upd_data.waveform_mode == WAVEFORM_MODE_AUTO)) {
 		epdc_set_update_waveform(&fb_data->wv_modes);
@@ -5632,6 +5953,15 @@ static int mxc_epdc_fb_ioctl(struct fb_info *info, unsigned int cmd,
 					info);
 			break;
 		}
+	case MXCFB_E70Q10_SET_SOURCE_BOUNDS:
+		{
+			struct mxcfb_e70q10_source_bounds bounds;
+
+			if (copy_from_user(&bounds, argp, sizeof(bounds)))
+				return -EFAULT;
+			ret = e70q10_set_source_bounds(fb_data, &bounds);
+			break;
+		}
 	case MXCFB_SEND_UPDATE:
 		{
 			struct mxcfb_update_data upd_data;
@@ -5861,7 +6191,7 @@ static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 		powered_on = fb_data->power_state == POWER_STATE_ON;
 		mutex_unlock(&fb_data->power_mutex);
 		if (!powered_on)
-			return 0;
+			return epdc_flush_panel_powerdown(fb_data);
 	}
 
 	fb_data->blank = blank;
@@ -5917,6 +6247,11 @@ static int mxc_epdc_fb_blank(int blank, struct fb_info *info)
 		break;
 	}
 
+	/* SEND/drain -> EPDC off -> physical rails off -> blank completion.
+	 * The 500ms retention policy applies only to ordinary runtime idle.
+	 */
+	if (!ret && blank == FB_BLANK_POWERDOWN)
+		ret = epdc_flush_panel_powerdown(fb_data);
 	if (ret)
 		fb_data->blank = old_blank;
 	return ret;
@@ -5969,6 +6304,7 @@ static int mxc_epdc_fb_pan_display(struct fb_var_screeninfo *var,
 	fb_data->fb_offset = (var->yoffset * var->xres_virtual + var->xoffset)
 		* (var->bits_per_pixel) / 8;
 	fb_data->fb_source_generation++;
+	fb_data->source_bounds_valid = false;
 	if (fb_data->page_lifetime_diag) {
 		unsigned long page_flags;
 		int page = epdc_fb_page_index(fb_data, fb_data->fb_offset);
@@ -6767,7 +7103,7 @@ static void epdc_intr_work_func(struct work_struct *work)
 			fb_data->cur_update->update_desc->upd_data.temp);
 		epdc_set_temp(temp_index);
 	} else
-		epdc_set_temp(fb_data->temp_index);
+		epdc_set_temp(READ_ONCE(fb_data->temp_index));
 	epdc_set_update_addr(fb_data->cur_update->phys_addr +
 				fb_data->cur_update->update_desc->epdc_offs);
 	epdc_set_update_coord(next_upd_region->left, next_upd_region->top);
@@ -7223,11 +7559,33 @@ static ssize_t page_lifetime_stats_show(struct device *dev,
 	len += scnprintf(buf + len, PAGE_SIZE - len,
 		" deferred_latest_refs=%u",
 		fb_data->deferred_latest_snapshot.refs);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		" snapshot_bytes=%llu snapshot_partial=%llu",
+		(unsigned long long)fb_data->source_snapshot_bytes,
+		(unsigned long long)fb_data->source_snapshot_partial_copies);
+	len += scnprintf(buf + len, PAGE_SIZE - len,
+		" snapshot_coverage_misses=%llu snapshot_merge_blocks=%llu\n",
+		(unsigned long long)fb_data->source_snapshot_coverage_misses,
+		(unsigned long long)fb_data->source_snapshot_merge_blocks);
 	mutex_unlock(&fb_data->queue_mutex);
-
-	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
 	return len;
 }
+
+static ssize_t epdc_temperature_show(struct device *dev,
+		struct device_attribute *attr, char *buf)
+{
+	struct fb_info *info = dev_get_drvdata(dev);
+	struct mxc_epdc_fb_data *fb_data = (struct mxc_epdc_fb_data *)info;
+	int temperature;
+
+	mutex_lock(&fb_data->power_mutex);
+	temperature = fb_data->ambient_temperature;
+	mutex_unlock(&fb_data->power_mutex);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", temperature);
+}
+
+static struct device_attribute fb_temperature_attr =
+	__ATTR(temperature, 0444, epdc_temperature_show, NULL);
 
 static struct device_attribute fb_attrs[] = {
 	__ATTR(update, S_IWUSR, NULL, store_update),
@@ -7666,7 +8024,7 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 
 	/*
 	 * Android HWC1 releases framebuffer targets without an EPDC source fence.
-	 * Keep a small bounded pool of immutable full-frame sources for queued
+	 * Keep a small bounded pool of immutable sources for queued
 	 * E70Q10 updates. Three normal slots match the Android framebuffer page
 	 * count. A separate one-deep reserve retains the newest eligible ordinary
 	 * update when all normal slots are owned by live descriptors.
@@ -8028,6 +8386,9 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 	fb_data->wait_for_powerdown = false;
 	fb_data->updates_active = false;
 	fb_data->pwrdown_delay = 0;
+	if (of_machine_is_compatible("ridi,e70q10"))
+		fb_data->pwrdown_delay = 20;
+	fb_data->ambient_temperature = DEFAULT_TEMP;
 
 	/* Register FB */
 	ret = register_framebuffer(info);
@@ -8045,6 +8406,11 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 			info->node, ret);
 		unregister_framebuffer(info);
 		goto out_lutmap;
+	}
+	if (of_machine_is_compatible("ridi,e70q10")) {
+		ret = device_create_file(info->dev, &fb_temperature_attr);
+		if (ret)
+			goto remove_fb_attrs;
 	}
 	if (fb_data->page_lifetime_diag) {
 		stats_ret = device_create_file(info->dev,
@@ -8072,6 +8438,8 @@ int mxc_epdc_fb_probe(struct platform_device *pdev)
 	goto out;
 
 remove_fb_attrs:
+	if (of_machine_is_compatible("ridi,e70q10"))
+		device_remove_file(info->dev, &fb_temperature_attr);
 	if (fb_data->page_lifetime_stats_created) {
 		device_remove_file(info->dev, &fb_page_lifetime_stats_attr);
 		fb_data->page_lifetime_stats_created = false;
@@ -8154,6 +8522,8 @@ static int mxc_epdc_fb_remove(struct platform_device *pdev)
 	if (fb_data->page_lifetime_stats_created)
 		device_remove_file(fb_data->info.dev,
 				  &fb_page_lifetime_stats_attr);
+	if (of_machine_is_compatible("ridi,e70q10"))
+		device_remove_file(fb_data->info.dev, &fb_temperature_attr);
 	device_remove_file(fb_data->info.dev, &fb_attrs[0]);
 	unregister_framebuffer(&fb_data->info);
 

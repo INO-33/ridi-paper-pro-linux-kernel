@@ -156,6 +156,16 @@ struct mxcfb_update_marker_data {
 	__u32 collision_test;
 };
 
+/* Optional ordinary-post source contract. Invalidated by the next pan.
+ * All SEND rectangles for this post must fit update_region. The producer
+ * keeps this framebuffer page unchanged until the batch has been submitted.
+ * Zero width/height clears the hint; callers without a hint use full copies.
+ */
+struct mxcfb_e70q10_source_bounds {
+	__u32 fb_offset;
+	struct mxcfb_rect update_region;
+};
+
 struct mxcfb_e70q10_sleep_barrier {
 	__u32 sequence;
 	__u32 marker_count;
@@ -224,6 +234,8 @@ struct mxcfb_buffer {
 #define MXCFB_GET_WORK_BUFFER		_IOWR('F', 0x34, unsigned long)
 #define MXCFB_DISABLE_EPDC_ACCESS	_IO('F', 0x35)
 #define MXCFB_ENABLE_EPDC_ACCESS	_IO('F', 0x36)
+#define MXCFB_E70Q10_SET_SOURCE_BOUNDS \
+	_IOW('F', 0x3a, struct mxcfb_e70q10_source_bounds)
 #define MXCFB_E70Q10_WAIT_SLEEP_BARRIER	\
 	_IOW('F', 0x39, struct mxcfb_e70q10_sleep_barrier)
 
